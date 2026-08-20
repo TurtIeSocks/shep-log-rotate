@@ -83,7 +83,9 @@ max_size = "10M"
 max_age = "7d"
 # Generations to keep. Older ones are deleted.
 keep = 5
-# gzip generations from .2 down. .1 stays plain so `tail` still works on it.
+# "dated" (default) or "numeric". See §4.
+naming = "dated"
+# gzip rotated generations, newest one left plain so it stays greppable.
 compress = true
 # How often to look.
 interval = "60s"
@@ -119,7 +121,36 @@ Each tick:
 
 ## 4. Rotating one file
 
-Classic `create` mode, which is what `shep reopen` is built for:
+Both schemes are `create`-mode, which is what `shep reopen` is built for:
+rename the current file, then ask shep to reopen the original path. They
+differ only in what the rotated file is called and therefore in how pruning
+works.
+
+### `naming = "dated"` (default)
+
+```
+web-0-out.log  ->  web-0-out.2026-08-20T15-04-05.log     then: Reopen
+```
+
+The timestamp carries seconds because rotation is size-triggered: a chatty
+sheep can rotate several times a minute, and day granularity would collide
+immediately. A same-second collision gets a counter appended
+(`...T15-04-05.1.log`), which in practice means a sheep filling `max_size`
+twice inside one second.
+
+**The extension stays last, deliberately.** `web-0-out.2026-08-20T15-04-05.log`
+still matches `*.log`, still opens with log syntax highlighting, and still
+gets found by every glob an operator already has. The numeric scheme quietly
+breaks all three.
+
+It is also self-describing, which is the argument that actually matters
+during an incident: `web-0-out.log.3` cannot tell you whether it covers
+Tuesday afternoon, and a dated name can.
+
+Default because shep's users are largely arriving from pm2, where
+`pm2-logrotate` is date-stamped, and because of the `*.log` point above.
+
+### `naming = "numeric"`
 
 ```
 web-0-out.log.4  ->  web-0-out.log.5     (oldest first, so nothing is overwritten)
@@ -128,32 +159,53 @@ web-0-out.log    ->  web-0-out.log.1
                      then: Reopen
 ```
 
-Numeric generations rather than timestamps: they sort obviously, need no
-parsing to prune, and match what every operator already expects from
-logrotate.
+The Unix convention, and on this machine already: macOS `newsyslog` writes
+`/var/log/system.log.0.gz`, Linux `logrotate` writes `syslog.1`. **The two
+disagree about whether the newest is `.0` or `.1`**, which is a fair warning
+against calling this settled. shep follows logrotate: newest is `.1`.
 
-**The window between rename and reopen is real, and correct.** shep holds an
-open descriptor, so lines written in that gap land in `.1` rather than
-vanishing. They are in the rotated generation instead of the current one,
-which is the honest outcome and worth documenting rather than hiding.
+Costs one rename per retained generation on every rotation, against one for
+dated. That is irrelevant at `keep = 5` and worth knowing at `keep = 200`.
 
-**If `Reopen` fails, stop rotating for this tick.** shep is still writing
-into `.1` through its existing handle, so nothing is lost and the situation
-self-corrects on the next successful reopen. Rotating further files while the
-reopen path is broken multiplies a recoverable state into a confusing one.
-Report it and back off.
+### The window between rename and reopen
+
+Identical in both schemes, real, and correct. shep holds an open descriptor,
+so lines written in that gap land in the rotated file rather than vanishing.
+They are in the previous generation instead of the current one, which is the
+honest outcome and worth documenting rather than hiding.
+
+**If `Reopen` fails, stop rotating for this tick.** shep is still writing into
+the renamed file through its existing handle, so nothing is lost and the
+situation self-corrects on the next successful reopen. Rotating further files
+while the reopen path is broken multiplies a recoverable state into a
+confusing one. Report it and back off.
 
 ## 5. Compression and pruning
 
-Compress from `.2` down, leaving `.1` plain so the most recent rotation is
-still greppable without a decompression step. Compression happens after the
-reopen, so a slow gzip never widens the rename-to-reopen window.
+Compress every rotated generation except the newest, which stays plain so the
+most recent rotation is greppable without a decompression step. Compression
+happens after the reopen, so a slow gzip never widens the rename-to-reopen
+window.
 
-**Prune only what this dog created.** Deletion is limited to paths matching
-its own generation pattern for a log path `ListFlock` reported. It will not
-delete a stray file in the log directory that merely looks old. A rotator
-that deletes something it did not write is a much worse bug than one that
-leaves files behind.
+Pruning is where the two schemes genuinely differ:
+
+- **dated** sorts the matching files by their embedded timestamp and deletes
+  past `keep`. No renaming, ever.
+- **numeric** deletes anything above `keep` after the shift, since the shift
+  itself has already ordered them.
+
+**Prune only what this dog created**, in both schemes. Deletion is limited to
+files whose names match the dog's own pattern for a log path `ListFlock`
+reported: for dated, the full timestamp shape, not merely "has a date in it".
+A rotator that deletes something it did not write is a far worse bug than one
+that leaves files behind.
+
+**Switching `naming` does not migrate anything.** Files written under the old
+scheme stop being pruned, because they no longer match the pattern, and are
+left for the operator rather than guessed at. Worth saying in the README: it
+is the one configuration change that leaves litter, and silently deleting
+files that a previous configuration created is not a trade this dog should
+make on its own.
 
 ## 6. Deliberately not doing
 
@@ -190,7 +242,12 @@ it needs a real shep to prove.
 - **A refused `Reopen`** leaves shep writing into `.1` and the dog reporting
   rather than looping.
 - **Pruning never deletes a file the dog did not create**, tested by putting
-  a decoy in the log directory.
+  a decoy in the log directory under each scheme, including a plausible
+  near-miss: a file with a date in the name that does not match the dog's
+  exact timestamp shape.
+- **Both schemes** run the full no-lost-lines test, not just the default. The
+  rename counts differ, so the rename-to-reopen window differs, and the
+  scheme with more renames is the one more likely to expose a race.
 
 ## 8. Assumptions
 
@@ -200,16 +257,25 @@ Judgement calls made on Rin's behalf, per delegate mode:
    published surface being usable is half the thing being tested.
 2. **Size-based rotation is the primary trigger**, with age optional. Size is
    what fills a disk.
-3. **Numeric generations, not timestamps.** Simpler to prune, matches
-   logrotate, no parsing.
-4. **`.1` stays uncompressed.** The most recent rotation is the one someone
-   greps.
-5. **Poll rather than subscribe.** The bus has no event for this.
-6. **Config re-read every tick**, mirroring the daemon's own choice not to
+3. **Both naming schemes, defaulting to dated.** Rin's call, 2026-08-20,
+   after pointing out that `*.log.{num}` is not what she has seen. Numeric is
+   genuinely the Unix convention and is on her own machine
+   (`/var/log/system.log.0.gz`), but it is not the convention the Node and
+   pm2 world uses, and it breaks `*.log` globbing and editor highlighting.
+4. **Dated timestamps carry seconds, with a counter for collisions.**
+   Rotation is size-triggered, so day granularity would collide on a chatty
+   sheep within the first minute.
+5. **The newest rotated generation stays uncompressed**, in both schemes. It
+   is the one someone greps.
+6. **Switching `naming` does not migrate existing files.** They stop being
+   pruned and are left alone. Deleting files a previous configuration created
+   is not this dog's call to make.
+7. **Poll rather than subscribe.** The bus has no event for this.
+8. **Config re-read every tick**, mirroring the daemon's own choice not to
    cache `[dog.<name>]`.
-7. **One `Reopen` per tick**, batched, rather than one per file.
-8. **Defaults for every field**, so an empty section works.
-9. **shep's own duration and size spellings**, strictness included.
+9. **One `Reopen` per tick**, batched, rather than one per file.
+10. **Defaults for every field**, so an empty section works.
+11. **shep's own duration and size spellings**, strictness included.
 
 ## 9. What this exercise already found in shep
 
