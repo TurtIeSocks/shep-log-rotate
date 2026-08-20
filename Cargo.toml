@@ -1,0 +1,31 @@
+[package]
+name = "shep-log-rotate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A log-rotation dog for shep: renames grown logs, asks the shepherd to reopen, then compresses and prunes"
+repository = "https://github.com/TurtIeSocks/shep-log-rotate"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["shep", "process-manager", "logrotate", "logging"]
+categories = ["command-line-utilities"]
+
+[features]
+# The tier that drives a REAL shepherd. Off by default because it needs a
+# `shep` binary, which a fresh clone does not have. See tests/integration.rs.
+integration = []
+
+[dependencies]
+shep-client = { git = "https://github.com/TurtIeSocks/shep", branch = "main" }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
+toml = "0.8"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "integration"
+required-features = ["integration"]
