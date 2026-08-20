@@ -413,9 +413,9 @@ fn collides_with_a_live_log(base: &LogPath, naming: Naming, protected: &BTreeSet
 }
 
 /// Whether `candidate` is a name `base` rotates into, or shifts, under
-/// `naming`. `resolved_dir` is [`prune::resolve`] of `base.dir`.
+/// `naming`. `resolved_dir` is `prune::resolve` of `base.dir`.
 ///
-/// The directory comparison resolves, exactly as [`prune::tidy`]'s own
+/// The directory comparison resolves, exactly as `prune::tidy`'s own
 /// protection does, and for the reason that one gives: path equality
 /// normalises `.` away but not `..`, and it knows nothing about symlinks.
 /// Two sheep can be handed the same log directory under two spellings, one

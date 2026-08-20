@@ -225,7 +225,7 @@ fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
 /// `canonicalize`, reading the empty path as the current directory and
 /// falling back to the path as written when it will not resolve.
 ///
-/// `pub(crate)` because [`tick`](crate::tick) asks the same question about
+/// `pub(crate)` because the `tick` module asks the same question about
 /// the same directories, on the rename half of the same guard. Two answers
 /// to "is this the directory I think it is" is one more than a guard can
 /// have: the rename guard missing a spelling this one catches means the
