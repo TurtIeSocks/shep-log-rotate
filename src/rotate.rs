@@ -36,14 +36,23 @@ pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<(PathBuf, Order
             source,
         })?;
         // Only a regular file can be a generation this dog wrote.
-        // match_generation matches by name alone, so a directory (or
-        // anything else) that merely collides with a generation's name shape
-        // - an operator's own subdirectory, say - would otherwise be swept
-        // up and renamed right along with real generations. Filtering by
-        // type here, before the name check gets a chance to run, is what
-        // keeps that collision from mattering. An entry whose type cannot be
-        // read is skipped for the same reason as a rejected name: the
-        // module's own rule is that an arguable case is not a match.
+        // match_generation matches by name alone, so anything else that
+        // merely collides with a generation's name shape - an operator's own
+        // subdirectory, or a symlink, say - would otherwise be swept up and
+        // renamed right along with real generations. Filtering by type here,
+        // before the name check gets a chance to run, is what keeps that
+        // collision from mattering.
+        //
+        // The symlink case is deliberate, not a side effect of reusing this
+        // same check: `DirEntry::file_type` mirrors `symlink_metadata`, so it
+        // does not follow a symlink to see what it points at, and a
+        // symlink's `is_file()` is `false` regardless of its target. shep
+        // never writes a generation as a symlink, so refusing to treat one
+        // as a match costs nothing real.
+        //
+        // An entry whose type cannot be read at all is skipped for the same
+        // reason as a rejected name: the module's own rule is that an
+        // arguable case is not a match.
         if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
             continue;
         }
@@ -67,6 +76,24 @@ pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<(PathBuf, Order
 
 /// Rename the live file at `base` to its next generation, returning the path
 /// it now has.
+///
+/// Assumes exactly one rotator is acting on `base`'s directory at a time.
+/// Finding a free target name and renaming into it are two separate
+/// syscalls, not one atomic check-and-rename (dated: `Path::exists` then
+/// `fs::rename`; numeric: `generations` then a sequence of `fs::rename`s).
+/// A second concurrent `rotate()` on the same `base` can choose the same
+/// target in the gap between those calls, and POSIX `fs::rename` silently
+/// replaces an existing destination rather than refusing - so the loser's
+/// generation is destroyed, not merely delayed.
+///
+/// This crate does not guard against that, deliberately: the realistic
+/// deployment is one rotator per `$SHEP_HOME`, and shep already enforces at
+/// most one running instance of an adopted dog by name (`start_dog` is
+/// idempotent), so two concurrent rotators would only happen if an operator
+/// hand-runs a second `shep-log-rotate` binary alongside the one shep is
+/// already supervising. Knowing "is this dog already running" is shep's
+/// job, not this crate's - this crate has no visibility into what else is
+/// running, so it has nothing to check even if it wanted to.
 pub fn rotate(base: &LogPath, naming: Naming, now: SystemTime) -> Result<PathBuf, Error> {
     match naming {
         Naming::Dated => rotate_dated(base, now),
@@ -85,7 +112,12 @@ fn rotate_dated(base: &LogPath, now: SystemTime) -> Result<PathBuf, Error> {
         if !candidate.exists() {
             break candidate;
         }
-        counter += 1;
+        // Every counter up to and including u32::MAX is already occupied
+        // for this second. Wrapping back to 0 would retest a slot already
+        // known occupied, forever, so refuse instead.
+        counter = counter
+            .checked_add(1)
+            .ok_or_else(|| Error::Exhausted { path: base.live() })?;
     };
     rename(&base.live(), &target)?;
     Ok(target)
@@ -107,10 +139,19 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
         let Order::Numeric { n } = order else {
             unreachable!("generations(_, Naming::Numeric) only ever returns Order::Numeric")
         };
+        // naming.rs's own numeric_generations_compress_and_stop_at_u32 proves
+        // n == u32::MAX is a generation match_generation legitimately
+        // recognises, so this is reachable by a planted file, not only in
+        // theory. Wrapping would produce `.0` - not a name match_generation
+        // ever matches back, so that generation would be orphaned rather
+        // than pruned - so refuse instead of wrapping.
+        let next_n = n
+            .checked_add(1)
+            .ok_or_else(|| Error::Exhausted { path: path.clone() })?;
         let next = if compressed {
-            with_gz(numeric_name(base, n + 1))
+            with_gz(numeric_name(base, next_n))
         } else {
-            numeric_name(base, n + 1)
+            numeric_name(base, next_n)
         };
         rename(&path, &next)?;
     }
@@ -293,71 +334,156 @@ mod tests {
         );
     }
 
-    /// What a shift failure leaves on disk, and whether shep is still safe
-    /// mid-shift.
+    /// What a shift failure leaves on disk when it lands on the *second*
+    /// rename attempted, not the first - proving an earlier commit survives
+    /// a later failure in the same shift, not just that a single-rename
+    /// shift leaves the live file alone.
     ///
-    /// A directory-shaped blocker at a generation's target name was the
-    /// first thing tried here, and it does not work: `generations` matches
-    /// purely by name, so a directory named `web-0-out.log.3` is picked up
-    /// as generation 3 itself and gets shifted out of the way like any other
-    /// generation, no different from a real one. Forcing a failure needs a
-    /// cause external to any single file's identity, so this revokes write
-    /// permission on the directory instead - the same permission every
-    /// rename in the loop needs, so the very first one attempted (the oldest
-    /// generation) is the one that fails. Not root: root ignores the
-    /// permission bits this test relies on.
-    ///
-    /// `fs::rename` is one atomic syscall, so a failed one is a no-op: the
-    /// source is exactly where it started. Nothing before this test's single
-    /// failure had a chance to commit, but the reasoning generalises from the
-    /// source, sequential loop in `rotate_numeric` - `?` returns on the first
-    /// `Err`, so every rename queued after the failing one, including the
-    /// final live-to-`.1` rename, simply never runs. Whatever renames *did*
-    /// commit before the failure stay committed; `rotate` does not roll them
-    /// back.
+    /// Real generations at `.2` and `.4` (a deliberate gap at `.1` and
+    /// `.3`), plus a plain directory planted at `.3`. Oldest first, the
+    /// shift attempts `.4` -> `.5` before `.2` -> `.3`: `.5` is free, so the
+    /// first rename commits; `.3` is the planted directory, so the second
+    /// lands on it and fails (`fs::rename` refuses to replace a directory
+    /// with a file). The gap at `.1`/`.3` is what makes this possible at
+    /// all - a blocker can only sit on a name no *real* generation currently
+    /// occupies, since the two can't coexist at one path. See
+    /// `a_directory_that_matches_the_name_shape_is_not_a_generation` for the
+    /// simpler one-rename version of that same constraint.
     #[test]
-    #[cfg(unix)]
-    fn a_shift_failure_leaves_the_live_file_in_place_for_the_next_tick_to_retry() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn a_later_shift_failure_leaves_the_earlier_commit_in_place() {
         let dir = tempfile::tempdir().expect("tempdir");
-        seed(dir.path(), "web-0-out.log.1", "gen1\n");
+        seed(dir.path(), "web-0-out.log.2", "gen2\n");
+        seed(dir.path(), "web-0-out.log.4", "gen4\n");
+        fs::create_dir(dir.path().join("web-0-out.log.3")).expect("planted blocker");
         let live = seed(dir.path(), "web-0-out.log", "live\n");
         let base = LogPath::split(&live).expect("splits");
 
-        let original_perms = fs::metadata(dir.path()).expect("stat").permissions();
-        fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).expect("chmod");
-        let outcome = rotate(&base, Naming::Numeric, std::time::SystemTime::UNIX_EPOCH);
-        fs::set_permissions(dir.path(), original_perms).expect("restore chmod for cleanup");
-
-        let err = outcome.expect_err(
-            "a read-only directory must surface as an error, not silently do nothing (skip this test when run as root)",
-        );
+        let err = rotate(&base, Naming::Numeric, std::time::SystemTime::UNIX_EPOCH)
+            .expect_err("the blocked rename must surface, not get swallowed");
         assert!(
             matches!(err, Error::Io { .. }),
             "a failed fs call must map through Error::Io: {err:?}"
         );
 
-        // Nothing moved: the source generation and the live file are both
-        // exactly where they started, so shep's already-open descriptor is
-        // still writing to the path it thinks it is.
+        // The earlier step (oldest generation, .4 -> .5) already committed
+        // before the failure and stays committed - rotate does not roll it
+        // back just because a later step in the same shift failed.
+        assert!(!dir.path().join("web-0-out.log.4").exists());
         assert_eq!(
-            fs::read_to_string(dir.path().join("web-0-out.log.1")).expect("read"),
-            "gen1\n"
+            fs::read_to_string(dir.path().join("web-0-out.log.5")).expect("read"),
+            "gen4\n"
         );
+
+        // The failing step itself (.2 -> .3) left its source untouched -
+        // fs::rename is a single atomic syscall, so a failed one is a no-op.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web-0-out.log.2")).expect("read"),
+            "gen2\n"
+        );
+        assert!(
+            dir.path().join("web-0-out.log.3").is_dir(),
+            "the blocker is unaffected"
+        );
+
+        // The live file's own rename is queued after every generation shift,
+        // so it never even ran: shep's already-open descriptor is still
+        // writing to the path it thinks it is.
         assert!(
             live.exists(),
             "the live file must stay put on a failed shift"
         );
         assert_eq!(fs::read_to_string(&live).expect("read"), "live\n");
 
-        // The failure is not self-healing, but it is not damaging either:
-        // once whatever blocked the rename clears, the exact same call
-        // succeeds, because nothing was left half-done to confuse it.
+        // Not self-healing, but not damaging either: once the obstruction is
+        // gone, the exact same call succeeds, because nothing was left
+        // half-done to confuse it.
+        fs::remove_dir(dir.path().join("web-0-out.log.3")).expect("clear the blocker");
         let retried = rotate(&base, Naming::Numeric, std::time::SystemTime::UNIX_EPOCH)
             .expect("the next tick recovers once the obstruction is gone");
         assert!(!live.exists());
         assert_eq!(fs::read_to_string(&retried).expect("read"), "live\n");
+    }
+
+    /// The `checked_add` guard in `rotate_numeric`, exercised for real:
+    /// naming.rs's own `numeric_generations_compress_and_stop_at_u32` proves
+    /// `.{u32::MAX}` is a name `match_generation` legitimately recognises,
+    /// so a single planted file reaches the overflow path directly - no
+    /// need to seed the 2^32 generations that would be needed to reach it
+    /// by counting up from `.1`. (The dated side's `counter` guard takes
+    /// the identical `checked_add`/`ok_or_else` shape but has no equivalent
+    /// shortcut - reaching it needs every counter from 0 to `u32::MAX` to
+    /// already exist - so it is exercised only by inspection, not a test.)
+    #[test]
+    fn a_numeric_generation_at_u32_max_refuses_rather_than_wraps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed(
+            dir.path(),
+            &format!("web-0-out.log.{}", u32::MAX),
+            "oldest\n",
+        );
+        let live = seed(dir.path(), "web-0-out.log", "live\n");
+        let base = LogPath::split(&live).expect("splits");
+
+        let err = rotate(&base, Naming::Numeric, std::time::SystemTime::UNIX_EPOCH)
+            .expect_err("incrementing u32::MAX must refuse, not wrap around to .0");
+        assert!(
+            matches!(err, Error::Exhausted { .. }),
+            "must be Error::Exhausted, not swallowed or misreported: {err:?}"
+        );
+
+        // Refusing leaves everything exactly where it was: no half-applied
+        // wrap, and critically no orphaned `.0` that match_generation could
+        // never find again.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(format!("web-0-out.log.{}", u32::MAX)))
+                .expect("read"),
+            "oldest\n"
+        );
+        assert!(
+            !dir.path().join("web-0-out.log.0").exists(),
+            "must not have wrapped to .0"
+        );
+        assert!(live.exists(), "the live file must stay put on refusal");
+    }
+
+    /// Same decision as
+    /// `a_directory_that_matches_the_name_shape_is_not_a_generation`, made
+    /// explicit for the other entry type `file_type()` distinguishes.
+    /// `DirEntry::file_type` mirrors `symlink_metadata`, so it does not
+    /// follow a symlink to see what it points at - a symlink's `is_file()`
+    /// is `false` regardless of its target, so it is excluded by the same
+    /// check, deliberately: shep never writes a generation as a symlink.
+    ///
+    /// Unlike a directory, a symlink does not *block* a rename that lands on
+    /// it - `fs::rename` treats it like any other non-directory destination
+    /// and replaces the directory entry outright. The symlink disappears;
+    /// whatever it pointed at is untouched, since rename only ever touches
+    /// the directory entry, never the target.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_that_matches_the_name_shape_is_not_a_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = seed(dir.path(), "elsewhere.txt", "not a generation\n");
+        std::os::unix::fs::symlink(&target, dir.path().join("web-0-out.log.1")).expect("symlink");
+        let live = seed(dir.path(), "web-0-out.log", "live\n");
+        let base = LogPath::split(&live).expect("splits");
+
+        let found = generations(&base, Naming::Numeric).expect("listed");
+        assert!(
+            found.is_empty(),
+            "a symlink is not a generation even when its name matches: {found:?}"
+        );
+
+        rotate(&base, Naming::Numeric, std::time::SystemTime::UNIX_EPOCH).expect("rotates");
+        assert!(!dir.path().join("web-0-out.log.1").is_symlink());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web-0-out.log.1")).expect("read"),
+            "live\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("read"),
+            "not a generation\n"
+        );
     }
 
     /// A directory can collide with a generation's name shape (an

@@ -29,6 +29,19 @@ pub enum Error {
         /// The underlying failure.
         source: std::io::Error,
     },
+    /// A generation counter for one log has reached `u32::MAX`, so the next
+    /// rotation would need to wrap it rather than advance it.
+    ///
+    /// Wrapping is worse than refusing: a wrapped dated counter would retest
+    /// a same-second slot already known to be occupied, forever, and a
+    /// wrapped numeric generation would produce `.0`, a name
+    /// `naming::match_generation` never recognises again - orphaned rather
+    /// than pruned. See `rotate::rotate_dated` and `rotate::rotate_numeric`.
+    Exhausted {
+        /// The log (or, mid numeric shift, the specific generation file)
+        /// whose next number would have wrapped.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for Error {
@@ -39,6 +52,13 @@ impl fmt::Display for Error {
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config(err) => write!(f, "bad [dog.log-rotate] section: {err}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Exhausted { path } => {
+                write!(
+                    f,
+                    "{}: no generation numbers left to rotate into",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -50,7 +70,7 @@ impl core::error::Error for Error {
             Self::Request(err) => Some(err),
             Self::Config(err) => Some(err),
             Self::Io { source, .. } => Some(source),
-            Self::Protocol(_) => None,
+            Self::Protocol(_) | Self::Exhausted { .. } => None,
         }
     }
 }
