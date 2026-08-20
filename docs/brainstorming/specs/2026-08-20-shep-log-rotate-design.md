@@ -1,4 +1,4 @@
-# shep-log-rotate — design
+# shep-log-rotate: design
 
 **Date:** 2026-08-20
 **Status:** delegate-mode design, awaiting Rin's review
