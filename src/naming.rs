@@ -47,6 +47,20 @@ pub struct LogPath {
 impl LogPath {
     /// Split a log path into directory, stem and final extension.
     ///
+    /// A path with no directory component gets `.`, not the empty path.
+    /// `Path::new("app.log").parent()` is `Some("")` rather than `None`, and
+    /// the empty path is not a directory anything can read: `fs::read_dir("")`
+    /// is `NotFound`. `rotate::generations` reads a `NotFound` as "this sheep
+    /// has never started" and returns an empty list, so a base spelled
+    /// without a directory component would report no generations however many
+    /// were on disk, and the numeric shift would rename the live file over
+    /// the top of generation 1. shep does not absolutise a Flockfile's
+    /// `out_file`, so a relative one arrives here exactly as it was written.
+    ///
+    /// The substitution lives here, once, so every consumer inherits it: a
+    /// second copy of this rule somewhere downstream is a copy that can be
+    /// missing from a third place.
+    ///
     /// Returns `None` if `path` has no file name, or if the file name or its
     /// directory is not valid UTF-8. A path this dog cannot spell is a path
     /// it must not go on to rename or delete.
@@ -59,11 +73,11 @@ impl LogPath {
             Some(ext) => Some(ext.to_str()?.to_owned()),
             None => None,
         };
-        Some(Self {
-            dir: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-            stem,
-            ext,
-        })
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        Some(Self { dir, stem, ext })
     }
 
     /// Rebuild the live log path this was split from.
@@ -861,14 +875,23 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_path_splits_with_an_empty_directory() {
+    fn a_relative_path_splits_to_the_current_directory() {
+        // `Path::new("web-0-out.log").parent()` is `Some("")`, not `None`,
+        // and an empty directory is not a directory anything can read:
+        // `fs::read_dir("")` is `NotFound`. `rotate::generations` reads a
+        // `NotFound` as "this sheep has never started", which for a base
+        // with no directory component would mean every generation on disk
+        // is invisible and the numeric shift renames over the top of one.
+        // The empty parent is turned into `.` here, once, so no consumer
+        // has to know about it.
         let here = LogPath::split(Path::new("web-0-out.log")).expect("splits");
-        assert_eq!(here.dir, Path::new(""));
-        assert_eq!(here.live(), Path::new("web-0-out.log"));
+        assert_eq!(here.dir, Path::new("."));
+        assert_eq!(here.live(), Path::new("./web-0-out.log"));
         assert_eq!(
             dated_name(&here, "2026-08-20T15-04-05", 0),
-            Path::new("web-0-out.2026-08-20T15-04-05.log")
+            Path::new("./web-0-out.2026-08-20T15-04-05.log")
         );
+        assert_eq!(numeric_name(&here, 1), Path::new("./web-0-out.log.1"));
     }
 
     #[test]

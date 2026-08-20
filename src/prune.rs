@@ -222,8 +222,8 @@ fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
     path.file_name().is_some_and(|name| names.contains(name))
 }
 
-/// `canonicalize`, reading the empty path as the current directory and
-/// falling back to the path as written when it will not resolve.
+/// `canonicalize`, falling back to the path as written when it will not
+/// resolve.
 ///
 /// `pub(crate)` because the `tick` module asks the same question about
 /// the same directories, on the rename half of the same guard. Two answers
@@ -231,12 +231,13 @@ fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
 /// have: the rename guard missing a spelling this one catches means the
 /// rename happens and the protection afterwards has nothing left to
 /// protect.
+///
+/// There is deliberately no special case for the empty path here. Every
+/// directory that reaches this function came through [`LogPath::split`],
+/// which already reads a missing directory component as `.`, and a second
+/// copy of that rule down here would be a copy that can go missing from a
+/// third place.
 pub(crate) fn resolve(path: &Path) -> PathBuf {
-    let path = if path.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        path
-    };
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 

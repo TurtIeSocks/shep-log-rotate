@@ -189,6 +189,84 @@ mod tests {
         path
     }
 
+    /// Serialises the two tests that have to run from inside a temporary
+    /// directory. The working directory belongs to the process, not to a
+    /// thread, and the default test harness runs these in parallel.
+    ///
+    /// Poisoning is recovered from rather than propagated: a panic in one
+    /// of these tests must not turn the other into a second failure
+    /// reporting the first one's crime.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` with the process working directory set to `dir`, putting
+    /// the old one back before returning whatever `body` produced.
+    ///
+    /// `body` does the file system work and nothing else; the assertions
+    /// belong to the caller, after the working directory is back. A panic
+    /// inside here would leave every later test looking at the wrong
+    /// directory.
+    fn within<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+        let _guard = CWD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::current_dir().expect("a working directory");
+        std::env::set_current_dir(dir).expect("moved into the temporary directory");
+        let outcome = body();
+        std::env::set_current_dir(previous).expect("moved back");
+        outcome
+    }
+
+    #[test]
+    fn a_base_with_no_directory_component_still_sees_its_generations() {
+        // `Path::new("web-0-out.log").parent()` is `Some("")`, and
+        // `fs::read_dir("")` is `NotFound`, which this module swallows as
+        // "this sheep has never started". A base spelled without a
+        // directory component would therefore report no generations
+        // however many are on disk. `LogPath::split` reads that empty
+        // parent as `.` so this cannot happen.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let found = within(dir.path(), || {
+            seed(std::path::Path::new("."), "web-0-out.log.1", "older\n");
+            seed(std::path::Path::new("."), "web-0-out.log.2", "oldest\n");
+            seed(std::path::Path::new("."), "web-0-out.log", "live\n");
+            let base = LogPath::split(std::path::Path::new("web-0-out.log")).expect("splits");
+            generations(&base, Naming::Numeric).expect("listed")
+        });
+
+        assert_eq!(
+            found.len(),
+            2,
+            "both generations are on disk and both are ours: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_named_base_does_not_overwrite_its_own_first_generation() {
+        // The consequence of the above, measured rather than argued. With
+        // an unreadable directory the numeric shift believes there is
+        // nothing to move, so the second rotation renames the live file
+        // straight over generation 1 and that log is gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (first, second) = within(dir.path(), || {
+            seed(std::path::Path::new("."), "web-0-out.log", "first\n");
+            let base = LogPath::split(std::path::Path::new("web-0-out.log")).expect("splits");
+            rotate(&base, Naming::Numeric, SystemTime::UNIX_EPOCH).expect("rotates");
+            seed(std::path::Path::new("."), "web-0-out.log", "second\n");
+            rotate(&base, Naming::Numeric, SystemTime::UNIX_EPOCH).expect("rotates again");
+            (
+                fs::read_to_string(dir.path().join("web-0-out.log.2")).ok(),
+                fs::read_to_string(dir.path().join("web-0-out.log.1")).ok(),
+            )
+        });
+
+        assert_eq!(
+            first.as_deref(),
+            Some("first\n"),
+            "generation 1 was shifted to .2, not overwritten"
+        );
+        assert_eq!(second.as_deref(), Some("second\n"));
+    }
+
     #[test]
     fn dated_rotation_renames_the_live_file_and_leaves_the_path_free() {
         let dir = tempfile::tempdir().expect("tempdir");
