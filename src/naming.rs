@@ -309,10 +309,36 @@ fn is_stamp(candidate: &[u8]) -> bool {
             .iter()
             .fold(0, |acc, byte| acc * 10 + u32::from(byte - b'0'))
     };
-    (1..=12).contains(&field(5, 7))       // month
-        && (1..=31).contains(&field(8, 10))  // day
-        && field(11, 13) <= 23               // hour
-        && field(14, 16) <= 59               // minute
+    // The date is handed to jiff rather than range-checked field by field.
+    // Independent ranges accept dates that never happened -- 2026-02-30,
+    // 2026-02-29 in a year that is not a leap year, April 31st -- and every
+    // one of those is a name `stamp_utc` cannot write, so accepting it hands
+    // the pruner a file this dog did not create.
+    //
+    // The year is bounded below at the epoch for the same reason: `stamp_utc`
+    // renders a real instant, so a generation dated 1969 is somebody else's
+    // file whatever else it looks like.
+    let (year, month, day) = (field(0, 4), field(5, 7), field(8, 10));
+    if !(1970..=9999).contains(&year) {
+        return false;
+    }
+    let Ok(month) = i8::try_from(month) else {
+        return false;
+    };
+    let Ok(day) = i8::try_from(day) else {
+        return false;
+    };
+    let Ok(year) = i16::try_from(year) else {
+        return false;
+    };
+    if jiff::civil::Date::new(year, month, day).is_err() {
+        return false;
+    }
+    // The time stays hand-checked. Parsing it with jiff would accept second
+    // 60 as a leap second, which `stamp_utc` never writes and which the
+    // nonsense-digits test already pins as a refusal.
+    field(11, 13) <= 23        // hour
+        && field(14, 16) <= 59 // minute
         && field(17, 19) <= 59 // second
 }
 
@@ -515,6 +541,31 @@ mod tests {
                 counter: 0
             }
         );
+    }
+
+    #[test]
+    fn a_date_that_never_happened_is_not_a_match() {
+        // `stamp_utc` renders a real instant, so it can never write any of
+        // these. A matcher that accepts them hands Task 5 a file to delete
+        // that this dog did not create.
+        let base = LogPath::split(Path::new("/var/log/web-0-out.log")).expect("splits");
+        let impossible = [
+            "web-0-out.2026-02-30T00-00-00.log", // February has no 30th
+            "web-0-out.2026-02-29T00-00-00.log", // 2026 is not a leap year
+            "web-0-out.2100-02-29T00-00-00.log", // a century that is not a leap year
+            "web-0-out.2026-04-31T00-00-00.log", // April has 30 days
+            "web-0-out.2026-06-31T00-00-00.log",
+            "web-0-out.2026-09-31T00-00-00.log",
+            "web-0-out.2026-11-31T00-00-00.log",
+            "web-0-out.1969-07-20T20-17-40.log", // before the epoch
+            "web-0-out.0000-01-01T00-00-00.log",
+        ];
+        for candidate in impossible {
+            assert!(
+                match_generation(&base, Naming::Dated, candidate).is_none(),
+                "{candidate} is not a date this dog can have written"
+            );
+        }
     }
 
     #[test]
