@@ -9,7 +9,7 @@ use std::{fs, io, path::Path, path::PathBuf, time::SystemTime};
 use crate::{
     config::Naming,
     error::Error,
-    naming::{LogPath, Order, dated_name, match_generation, numeric_name, stamp_utc},
+    naming::{LogPath, Order, dated_name, match_generation, numeric_name, stamp_utc, with_gz},
 };
 
 /// Every generation this dog created for `base`, newest first.
@@ -149,7 +149,7 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
             .checked_add(1)
             .ok_or_else(|| Error::Exhausted { path: path.clone() })?;
         let next = if compressed {
-            with_gz(numeric_name(base, next_n))
+            with_gz(&numeric_name(base, next_n))
         } else {
             numeric_name(base, next_n)
         };
@@ -159,13 +159,6 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
     let target = numeric_name(base, 1);
     rename(&base.live(), &target)?;
     Ok(target)
-}
-
-/// Append a `.gz` suffix to a path already built by [`numeric_name`].
-fn with_gz(path: PathBuf) -> PathBuf {
-    let mut name = path.into_os_string();
-    name.push(".gz");
-    PathBuf::from(name)
 }
 
 /// `fs::rename`, mapping its error through `Error::Io` naming the source

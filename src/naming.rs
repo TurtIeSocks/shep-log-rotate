@@ -228,6 +228,23 @@ pub fn numeric_name(base: &LogPath, n: u32) -> PathBuf {
     base.dir.join(name)
 }
 
+/// Append a `.gz` suffix to a generation's path.
+///
+/// Appended to the whole name rather than swapped in as an extension, so
+/// `web-0-out.2026-08-20T15-04-05.log` becomes
+/// `web-0-out.2026-08-20T15-04-05.log.gz` and every glob an operator already
+/// has keeps working.
+///
+/// It lives next to [`match_generation`] because it is the other half of that
+/// function's `.gz` stripping. The suffix one writes is the suffix the other
+/// reads back, and two copies of it in two modules is two places for that
+/// agreement to drift.
+pub fn with_gz(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".gz");
+    PathBuf::from(name)
+}
+
 /// Recognise `file_name` as a generation of `base` under `naming`, reporting
 /// where it sits in the ordering and whether it is already compressed.
 ///
@@ -387,6 +404,31 @@ mod tests {
         assert_eq!(split.stem, "web-0-out");
         assert_eq!(split.ext.as_deref(), Some("log"));
         assert_eq!(split.live(), Path::new("/var/log/web-0-out.log"));
+    }
+
+    #[test]
+    fn every_name_with_gz_writes_is_matched_back_as_compressed() {
+        // The pairing that puts `with_gz` in this module: the suffix it
+        // writes is the suffix `match_generation` strips. A generation
+        // whose compressed name did not match back would be a file this
+        // dog created and could never prune.
+        let base = base();
+        let dated = dated_name(&base, "2026-08-20T15-04-05", 0);
+        let numeric = numeric_name(&base, 3);
+        for (path, naming) in [(dated, Naming::Dated), (numeric, Naming::Numeric)] {
+            let gz = with_gz(&path);
+            let name = gz.file_name().expect("name").to_str().expect("utf8");
+            let (order, compressed) =
+                match_generation(&base, naming, name).expect("its own .gz name matches back");
+            assert!(compressed, "{name} is compressed");
+            let plain = path.file_name().expect("name").to_str().expect("utf8");
+            let (plain_order, _) =
+                match_generation(&base, naming, plain).expect("the plain name matches back");
+            assert_eq!(
+                order, plain_order,
+                "{name} is the same generation as {plain}, wearing a second file"
+            );
+        }
     }
 
     #[test]

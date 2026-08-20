@@ -24,7 +24,7 @@ use flate2::{Compression, write::GzEncoder};
 use crate::{
     config::Config,
     error::Error,
-    naming::{LogPath, Order},
+    naming::{LogPath, Order, with_gz},
     rotate::generations,
 };
 
@@ -321,18 +321,6 @@ fn remove(path: &Path) -> Result<(), Error> {
         path: path.to_path_buf(),
         source,
     })
-}
-
-/// Append a `.gz` suffix to a generation's path.
-///
-/// Appended to the whole name rather than swapped in as an extension, so
-/// `web-0-out.2026-08-20T15-04-05.log` becomes
-/// `web-0-out.2026-08-20T15-04-05.log.gz` and every glob an operator already
-/// has keeps working.
-fn with_gz(path: &Path) -> PathBuf {
-    let mut name = path.to_path_buf().into_os_string();
-    name.push(".gz");
-    PathBuf::from(name)
 }
 
 #[cfg(test)]
