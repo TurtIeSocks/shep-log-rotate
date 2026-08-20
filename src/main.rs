@@ -102,14 +102,20 @@ impl Action {
     /// the whole argument surface is testable without a process.
     ///
     /// # Errors
-    /// [`Usage`] for any argument other than a single `--print-config`.
-    /// Unknown flags are refused rather than ignored: a rotator silently
-    /// ignoring `--dry-run` would rotate for real.
+    /// [`Usage`] for any argument other than `--print-config`. Unknown flags
+    /// are refused rather than ignored: a rotator silently ignoring
+    /// `--dry-run` would rotate for real.
+    ///
+    /// A repeated `--print-config` is accepted. It names the same action
+    /// however many times it is given, and refusing it meant answering
+    /// `--print-config --print-config` with "shep-log-rotate does not
+    /// understand --print-config", which is a confusing thing to tell
+    /// somebody who plainly does.
     pub fn parse<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Self, Usage> {
         let mut action = Self::Run;
         for arg in args {
             match arg {
-                "--print-config" if action == Self::Run => action = Self::PrintConfig,
+                "--print-config" => action = Self::PrintConfig,
                 "--help" | "-h" => {
                     return Err(Usage("shep-log-rotate takes no options.".to_owned()));
                 }
@@ -353,6 +359,17 @@ mod tests {
         assert_eq!(Action::parse(["--print-config"]), Ok(Action::PrintConfig));
         assert_eq!(Action::parse([]), Ok(Action::Run));
         assert!(Action::parse(["--rotate-now"]).is_err());
+    }
+
+    #[test]
+    fn the_same_flag_twice_names_the_same_action() {
+        // It used to be refused, with "shep-log-rotate does not understand
+        // --print-config" - which is a confusing thing to tell somebody who
+        // plainly does understand it.
+        assert_eq!(
+            Action::parse(["--print-config", "--print-config"]),
+            Ok(Action::PrintConfig)
+        );
     }
 
     #[test]
