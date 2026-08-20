@@ -169,7 +169,7 @@ impl Report {
         }
         if self.skipped_protected > 0 {
             line.push_str(&format!(
-                ", spared {} generation that is a live log",
+                ", refused {} times to touch a live log",
                 self.skipped_protected
             ));
         }
