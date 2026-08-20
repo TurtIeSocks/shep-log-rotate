@@ -116,14 +116,27 @@ pub struct Report {
     pub skipped: usize,
     /// Generations gzipped.
     pub compressed: usize,
-    /// Generations deleted for being past `keep`.
+    /// Files deleted for being past `keep`.
+    ///
+    /// Files rather than generations, because the two can differ. A
+    /// generation an earlier crash left half-compressed wears two files, and
+    /// they go together, so it contributes two. Assigned straight from
+    /// [`Tidied::deleted`](crate::prune::Tidied::deleted), so it carries
+    /// that field's unit and says so here rather than leaving the two types
+    /// disagreeing across the seam.
     pub deleted: usize,
     /// Logs left unrotated because a name this base rotates into is some
     /// sheep's live log. See the module docs. Anything above zero wants a
     /// human: the two logs need different names before either can rotate.
     pub skipped_collision: usize,
-    /// Generations `tidy` refused to compress or delete for the same
+    /// Times `tidy` refused to compress or delete a generation for the same
     /// reason.
+    ///
+    /// Refusals rather than files: one file can be the reason for two of
+    /// them, once as a candidate generation of its own and once as the name
+    /// some other generation wanted to compress into. Assigned straight from
+    /// [`Tidied::skipped_protected`](crate::prune::Tidied::skipped_protected),
+    /// so it carries that field's unit.
     pub skipped_protected: usize,
     /// The sheep whose reopen was refused, and what it said. Set means the
     /// tick stopped early and rotated no further sheep.
