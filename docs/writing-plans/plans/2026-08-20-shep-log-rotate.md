@@ -738,14 +738,14 @@ mod tests {
     fn the_stamp_is_utc_and_nineteen_characters() {
         let at = std::time::UNIX_EPOCH + core::time::Duration::from_secs(1_787_324_645);
         let stamp = stamp_utc(at);
+        assert_eq!(stamp, "2026-08-21T15-04-05", "the stamp is UTC, not local");
         assert_eq!(stamp.len(), 19);
-        assert_eq!(stamp.as_bytes()[10], b'T');
         assert!(!stamp.contains(':'), "colons are not portable in filenames: {stamp}");
     }
 }
 ```
 
-The exact expected value in the last test must be computed by the implementer from the real `jiff` output and pinned, not left as a length assertion alone. Add `assert_eq!(stamp, "<the real value>")` once observed.
+The expected value is pinned rather than left as a shape assertion, and it is UTC: `date -u -r 1787324645` agrees. If `jiff` produces a local-time value here, the implementation used the wrong clock and the test is doing its job.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1485,7 +1485,43 @@ The loop:
 4. **A failed tick is logged and retried on the next interval, not fatal.** The shepherd restarting underneath a dog is ordinary; exiting would make the supervisor restart this process for a condition that resolves itself. Reconnect if the error is `Connect` or `Request`.
 5. **No signal handler beyond ctrl_c for a clean exit.** The shepherd owns this process's signals and its kill ladder. `SIGHUP`-triggered rotation is a shape people expect, and adding it here would be arguing with the supervisor.
 
-The dog's own name is read from `$SHEP_DOG_NAME` if shep sets it, defaulting to `log-rotate`. **The implementer must check whether the daemon exports such a variable** (`grep -rn "SHEP_DOG" /Users/rin/GitHub/pm2-rs/crates/`) and, if it does not, default to `log-rotate` and say in the README that the dog must be adopted under that name. Report which it is.
+**Discovering this dog's own name, which is harder than it looks and matters more than it looks.**
+
+Checked so you do not have to: **shep exports no such variable.** An adopted dog is spawned with `DogSource::Adopted { path } => (path.clone(), Vec::new())` and exactly one environment entry, `config.env.insert("SHEP_HOME", ...)` (`crates/shep-daemon/src/dogs.rs`). No argv, one variable. The comment there explains why, and the reasoning is sound: "an argv shep invented for it is one more thing it has to agree with before it can start."
+
+But the name is the one thing this dog needs, because it is the `[dog.<name>]` key its config lives under. **The failure is silent.** `Request::DogConfig { name }` for a name nobody adopted returns the **empty string**, which is exactly what a real dog with no config section returns. Adopt this binary as `logrotate` instead of `log-rotate` and every setting in the operator's `shep.toml` is ignored, with no error printed anywhere, by either side.
+
+So find the name rather than assuming it. This process knows its own pid, and `ListFlock` reports a pid per entry:
+
+```rust
+/// The name this dog was adopted under, found by looking for ourselves in
+/// the flock.
+///
+/// A dog is given no argv and one environment variable, so it cannot be
+/// TOLD its own name. It can still work it out: this process knows its pid,
+/// and the flock entry that is a dog and carries that pid is this process.
+///
+/// `None` means we could not identify ourselves, which the caller reports
+/// out loud before falling back. It must never fail silently: a wrong name
+/// means the operator's whole configuration section is ignored and every
+/// default is used instead, which looks exactly like working.
+async fn adopted_name<D: Daemon>(daemon: &D) -> Option<String> {
+    let me = std::process::id();
+    daemon
+        .list_flock()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|info| info.dog.is_some() && info.pid == Some(me))
+        .map(|info| info.name)
+}
+```
+
+Fall back to `log-rotate` when it returns `None`, and print a line to stderr saying the dog could not identify itself in the flock and is assuming that name. A dog that cannot find itself still works; a dog that silently reads the wrong config section does not.
+
+**This adds a `Daemon` method requirement:** `adopted_name` uses `list_flock`, which the trait already has. No new method.
+
+**Prove it in the integration tier, because the pid assumption is exactly the kind of thing that is true until it is not** (an interpreter mapping, a wrapper, or a future exec would all break it). Adopt the dog under a NON-default name, give it a `[dog.<that name>]` section with a distinctive `max_size`, and assert the dog rotates at that size rather than at the 10M default. That test fails loudly if pid discovery ever stops working, which is the only way anyone would find out.
 
 - [ ] **Step 4: Write `tests/integration.rs`**
 
@@ -1566,3 +1602,4 @@ Three findings from this exercise, already recorded in `docs/specs/deferred.md` 
 1. **`Flush`'s name invites a destructive mistake.** "Flush the logs before rotating" is the natural instinct and it truncates them. The wire documentation is accurate; the name is the trap. Worth a sentence in `docs/dogs.md` warning a dog author off it, since a rotator is the most likely thing to reach for it.
 2. **The daemon's own logs cannot be rotated by anything.** No reopen path exists for `shepd.out.log` or `shepd.err.log`. On a long-running shepherd they grow without bound.
 3. **`docs/dogs.md` documents the wire but not a worked external dog.** This project can become the example it points at.
+4. **A dog cannot learn the name it was adopted under, and getting it wrong fails silently.** An adopted dog receives no argv and one environment variable, `SHEP_HOME`. Its name is the `[dog.<name>]` key its own configuration lives under, and `DogConfig` for a name nobody adopted returns the empty string, which is indistinguishable from a real dog with no section. So adopting a dog under a name its author did not expect silently discards the operator's entire configuration for it. This dog works around it by finding its own pid in `ListFlock`, which works but is a workaround every dog author would have to reinvent. Worth a sentence in `docs/dogs.md` at minimum, and worth considering whether `dog_app` should pass the name after all, or whether `DogConfig` should distinguish "no such dog" from "no section".
