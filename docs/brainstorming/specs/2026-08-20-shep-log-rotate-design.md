@@ -1,4 +1,4 @@
-# shep-log-rotate — design
+# shep-log-rotate: design
 
 **Date:** 2026-08-20
 **Status:** delegate-mode design, awaiting Rin's review
@@ -80,7 +80,8 @@ stopped.
 # Rotate a log once it reaches this size.
 max_size = "10M"
 # Optionally also rotate on age, whatever the size.
-max_age = "7d"
+# shep has no day unit: a week is 168h.
+max_age = "168h"
 # Generations to keep. Older ones are deleted.
 keep = 5
 # "dated" (default) or "numeric". See §4.
