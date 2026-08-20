@@ -312,16 +312,41 @@ interval = "5s"
     }
 
     #[test]
-    fn the_printed_block_parses_back_to_the_defaults() {
-        // Every line in PRINT_CONFIG is commented except the header, so what
-        // survives uncommenting must be exactly what the defaults already are.
-        let uncommented: String = PRINT_CONFIG
+    fn every_value_the_printed_block_documents_is_the_value_the_code_uses() {
+        // PRINT_CONFIG has three kinds of line: the `[dog.log-rotate]` header,
+        // prose comments (`# ` with a space), and commented settings
+        // (`#key = value`, no space). Uncomment only the settings.
+        let uncommented: Vec<&str> = PRINT_CONFIG
             .lines()
-            .filter(|line| !line.trim_start().starts_with('#') && !line.trim().starts_with('['))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let config = Config::from_toml(&uncommented).expect("the printed block is valid");
-        assert_eq!(config, Config::default());
+            .filter_map(|line| line.strip_prefix('#'))
+            .filter(|rest| !rest.starts_with(' '))
+            .collect();
+
+        // The guard needs its own guard. The first version of this test used a
+        // filter that matched NOTHING, so it asserted `from_toml("")` equals
+        // the defaults -- true, vacuous, and a duplicate of
+        // `an_absent_section_is_a_working_configuration`. It would have passed
+        // with a `7d` in the block, the one spelling `UpDuration` refuses,
+        // which is precisely the drift this test exists to catch.
+        assert_eq!(
+            uncommented.len(),
+            6,
+            "expected one line per setting, got {uncommented:?}"
+        );
+
+        let config =
+            Config::from_toml(&uncommented.join("\n")).expect("the printed block is valid");
+
+        // `max_age` is the one field whose default is "unset", so the block
+        // documents a sample rather than a default. Everything else must be
+        // exactly what the code already does.
+        assert_eq!(
+            config,
+            Config {
+                max_age: Some("168h".parse().expect("a spelling shep accepts")),
+                ..Config::default()
+            }
+        );
     }
 
     #[test]
