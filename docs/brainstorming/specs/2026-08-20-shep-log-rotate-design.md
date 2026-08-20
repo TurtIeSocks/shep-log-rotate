@@ -277,7 +277,44 @@ Judgement calls made on Rin's behalf, per delegate mode:
 10. **Defaults for every field**, so an empty section works.
 11. **shep's own duration and size spellings**, strictness included.
 
-## 9. What this exercise already found in shep
+## 9. Deferred: a dog manifest
+
+Rin, 2026-08-20, asked whether a repo could ship a `Flockfile.toml` carrying
+the dog's registration and default config, so installing it were one command.
+
+**It cannot today, and the reason is a file-ownership boundary rather than a
+missing feature.** `RawFlockfile` is `deny_unknown_fields` over exactly two
+keys, `$schema` and `app`, so a Flockfile cannot mention a dog at all. That is
+deliberate: a Flockfile is the operator's file, committed in a service's repo,
+describing what to supervise. `shep.toml` is the daemon's file, one per
+machine, holding dogs, style and interpreters. A dog's registration belongs to
+the machine, not to any one repo, which is why `adopt` writes `shep.toml`.
+
+**Deferred, not rejected.** Not a blocker: `shep adopt <name> <path>` already
+vets, registers, enables and starts in one command, and this dog is designed
+so that an absent `[dog.log-rotate]` is a working configuration.
+
+What the idea is really reaching for is **discoverability** -- adopt a dog and
+nothing tells you what its knobs are. The near-term answer is that the dog
+documents itself:
+
+```
+shep-log-rotate --print-config >> ~/.shep/shep.toml
+```
+
+A commented block naming every option and its default, which is exactly what
+`shep init` does for a Flockfile. The dog owns its own defaults, so it is the
+right thing to own their documentation. No new shep surface and no new file
+type.
+
+**If a manifest is built later, the trust question is the thing to design
+around.** A `Dogfile.toml` that `adopt` reads means shep parsing a file the
+dog's author wrote and merging it into the operator's `shep.toml`. That is a
+larger step than "run this binary", and `adopt`'s existing vetting ritual
+exists because this boundary is taken seriously. Worth revisiting if a dog
+ecosystem appears; not worth pre-building for one dog.
+
+## 10. What this exercise already found in shep
 
 Worth carrying back regardless of whether this dog gets built:
 
