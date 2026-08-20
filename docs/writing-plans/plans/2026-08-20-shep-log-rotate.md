@@ -331,7 +331,7 @@ mod tests {
         let config = Config::from_toml(
             r#"
 max_size = "1M"
-max_age = "7d"
+max_age = "168h"
 keep = 3
 naming = "numeric"
 compress = false
@@ -533,8 +533,9 @@ impl Config {
 pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
 # Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
 #max_size = "10M"
-# Optionally also rotate on age, whatever the size. Unset means size only.
-#max_age = "7d"
+# Optionally also rotate on age, whatever the size.
+# shep has no day unit: a week is 168h. Unset means size only.
+#max_age = "168h"
 # Generations to keep. Older ones are deleted. Must be at least 1.
 #keep = 5
 # "dated" writes web-0-out.2026-08-20T15-04-05.log, in UTC, and still
