@@ -14,23 +14,38 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
 };
 
 use flate2::{Compression, write::GzEncoder};
 
-use crate::{config::Config, error::Error, naming::LogPath, rotate::generations};
+use crate::{
+    config::Config,
+    error::Error,
+    naming::{LogPath, Order},
+    rotate::generations,
+};
 
 /// What one pass of [`tidy`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tidied {
-    /// Generations gzipped on this pass.
+    /// Files gzipped on this pass. A generation is compressed at most once,
+    /// so this is also the number of generations compressed.
     pub compressed: usize,
-    /// Generations deleted on this pass for being past `keep`.
+    /// Files deleted on this pass for being past `keep`.
+    ///
+    /// Files rather than generations, because the two can differ. A
+    /// generation an earlier crash left half-compressed wears two files, and
+    /// they go together, so it contributes two.
     pub deleted: usize,
     /// Times a generation was left alone because acting on it would have
     /// written over or removed a path the caller named as a live log.
+    ///
+    /// Refusals rather than files: one file can be the reason for two of
+    /// them, once as a candidate generation of its own and once as the name
+    /// some other generation wanted to compress into.
     ///
     /// Anything above zero is a name collision worth reporting rather than
     /// discovering later. A base with no extension generates, byte for byte,
@@ -43,19 +58,49 @@ pub struct Tidied {
     pub skipped_protected: usize,
 }
 
+/// One rotated generation, and the file or files on disk carrying it.
+///
+/// Normally one file. Two only when an earlier pass crashed between writing
+/// the `.gz` and removing the plain copy: both halves parse to the same
+/// [`Order`], so they are one generation wearing two files and they share
+/// one slot. A slot each would let `keep` spare one half and delete the
+/// other, wiping the generation out while reporting that it survived.
+#[derive(Debug, Default)]
+struct Generation {
+    /// The uncompressed copy, while there still is one.
+    plain: Option<PathBuf>,
+    /// The gzipped copy, once there is one.
+    gz: Option<PathBuf>,
+}
+
+impl Generation {
+    /// Every file this generation still has on disk.
+    fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        [self.plain.as_ref(), self.gz.as_ref()]
+            .into_iter()
+            .flatten()
+    }
+}
+
 /// Compress and prune the generations of one log.
 ///
 /// The newest generation is left plain in both naming schemes, so the most
 /// recent rotation greps without a decompression step first. Everything past
 /// `config.keep` is deleted; `keep` counts rotated generations and never the
-/// live file, so `keep = 5` leaves five rotated files behind.
+/// live file, so `keep = 5` leaves five rotated generations behind.
+///
+/// A generation an earlier crash left half-compressed, a plain file and its
+/// `.gz` side by side, is one generation and takes one slot. Its files go
+/// together when it is pruned, and the next pass with compression on folds
+/// it back down to one file.
 ///
 /// No member of `protected` is ever compressed or deleted, whatever its name
 /// says, and none of them counts against `keep` either: a live log that
 /// happens to look like a generation is not one of this dog's, so sparing it
-/// must not cost a real generation its place. Paths are compared exactly as
-/// given, so the caller is the one that has to spell them the way
-/// [`std::fs::read_dir`] does.
+/// must not cost a real generation its place. Members are matched by file
+/// name within `base.dir`, with the directory resolved first, so a `..` in
+/// the caller's spelling or a symlinked log directory cannot quietly turn
+/// the guard off.
 ///
 /// # Errors
 /// [`Error::Io`], naming the path, if the log directory cannot be listed or
@@ -66,63 +111,168 @@ pub fn tidy(
     protected: &BTreeSet<PathBuf>,
 ) -> Result<Tidied, Error> {
     let mut tidied = Tidied::default();
+    let untouchable = protected_names(&base.dir, protected);
 
-    // Sift the protected paths out before anything counts positions. They
+    // Two things happen here, and both are about slots.
+    //
+    // Protected paths are sifted out before anything counts positions. They
     // are somebody else's live logs that merely read as generations, so they
-    // must not take up a slot that `keep` was meant to hold for a real one,
-    // and they must not be mistaken for the newest generation and so decide
-    // which file stays plain.
-    let mut ours: Vec<(PathBuf, bool)> = Vec::new();
-    for (path, _order, compressed) in generations(base, config.naming)? {
-        if protected.contains(&path) {
+    // must not take up a slot `keep` was holding for a real one, and they
+    // must not be mistaken for the newest generation and so decide which
+    // file stays plain.
+    //
+    // Files sharing an `Order` are folded into one slot, because they are
+    // one generation. `generations` returns its list sorted, so equal orders
+    // arrive adjacent and a single running comparison is enough.
+    let mut ours: Vec<Generation> = Vec::new();
+    let mut current: Option<Order> = None;
+    for (path, order, compressed) in generations(base, config.naming)? {
+        if is_protected(&untouchable, &path) {
             tidied.skipped_protected += 1;
             continue;
         }
-        ours.push((path, compressed));
+        if current.as_ref() != Some(&order) {
+            ours.push(Generation::default());
+            current = Some(order);
+        }
+        let generation = ours.last_mut().expect("a slot was pushed just above");
+        if compressed {
+            generation.gz = Some(path);
+        } else {
+            generation.plain = Some(path);
+        }
     }
 
     // Index 0 is the newest and stays plain. Compressing before pruning
     // rather than after is the readable order, not the frugal one: the
     // "newest stays plain" rule sits next to the list it is about.
     if config.compress {
-        for (path, compressed) in ours.iter_mut().skip(1) {
-            if *compressed {
+        for generation in ours.iter_mut().skip(1) {
+            let Some(plain) = generation.plain.clone() else {
                 continue;
-            }
-            let target = with_gz(path);
+            };
+            let target = with_gz(&plain);
             // The target is a file this pass is about to create or truncate.
             // Truncating a live log is the same harm as deleting one, so it
             // gets the same refusal.
-            if protected.contains(&target) {
+            if is_protected(&untouchable, &target) {
                 tidied.skipped_protected += 1;
                 continue;
             }
-            compress(path, &target)?;
-            *path = target;
-            *compressed = true;
+            // A `.gz` already sitting there is the half-written leftover of
+            // the crash that made this generation a twin. Overwriting it is
+            // how the interrupted compression finishes.
+            compress(&plain, &target)?;
+            generation.plain = None;
+            generation.gz = Some(target);
             tidied.compressed += 1;
         }
     }
 
-    for (path, _compressed) in ours.iter().skip(config.keep) {
-        remove(path)?;
-        tidied.deleted += 1;
+    // Both halves of a twin go together. Sparing either would leave a file
+    // no later pass can reach: it would be the same one generation every
+    // time, and one generation is one slot.
+    for generation in ours.iter().skip(config.keep) {
+        for path in generation.files() {
+            remove(path)?;
+            tidied.deleted += 1;
+        }
     }
 
     Ok(tidied)
 }
 
+/// The file names in `protected` that name a file in `dir`.
+///
+/// Comparing whole [`PathBuf`]s is not enough. Path equality normalises `.`
+/// away but not `..`, and it knows nothing about symlinks, so
+/// `/var/log/sub/../web.1` and a `/var/log` that is itself a link both slip
+/// past a whole-path comparison with nothing said about it. A guard that
+/// silently does nothing is worse than no guard at all, because the caller
+/// believes the file is safe. Resolving the directory once and comparing
+/// file names within it closes both.
+///
+/// This is defence in depth rather than the only line of it: the caller
+/// normalises when it builds the set. A path that will not resolve is
+/// compared as it was written, because failing to resolve something is not a
+/// reason to stop protecting it.
+fn protected_names(dir: &Path, protected: &BTreeSet<PathBuf>) -> BTreeSet<OsString> {
+    let resolved = resolve(dir);
+    let mut names = BTreeSet::new();
+    for path in protected {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        // The spellings usually agree already, and two comparisons are free
+        // next to a `canonicalize` for every member on every call.
+        if parent == dir || parent == resolved.as_path() || resolve(parent) == resolved {
+            names.insert(name.to_os_string());
+        }
+    }
+    names
+}
+
+/// Whether `path` names one of the caller's live logs.
+///
+/// By file name, which is sound only because every path this module acts on
+/// was built from `base.dir` and [`protected_names`] kept only the members
+/// that live there.
+fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
+    path.file_name().is_some_and(|name| names.contains(name))
+}
+
+/// `canonicalize`, reading the empty path as the current directory and
+/// falling back to the path as written when it will not resolve.
+fn resolve(path: &Path) -> PathBuf {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Create `target` truncated and already at `permissions`, and hand back the
+/// open handle.
+///
+/// The two steps live in one function because they have to stay adjacent.
+/// `File::create` opens at `0o666 & !umask`, so a chmod that drifts away
+/// from it, down to the end of a longer function say, leaves a log that is
+/// private for a reason readable by anyone for the entire length of the
+/// gzip. On a large log that is not a short window, and no test can see it:
+/// what a test can check is that the mode is right at the end, which is true
+/// either way. Keeping the pair together is the guard.
+///
+/// Only the empty file is ever at the creation mode, and the handle keeps
+/// its write access across the change, so a read-only mode still works here.
+fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
+    let file = fs::File::create(target).map_err(|source| Error::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    fs::set_permissions(target, permissions).map_err(|source| Error::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    Ok(file)
+}
+
 /// gzip `path` into `target`, then remove `path`.
 ///
 /// The order is the whole point. A crash after the write and before the
-/// remove leaves both files, and the pass that follows finds both, skips the
-/// `.gz` as already compressed and finishes the job. Removing first would
-/// lose the log outright, so the plain file is not touched until the
-/// compressed one is on the disk and durable.
+/// remove leaves both files, which is the state [`tidy`] recovers from: the
+/// two halves carry the same generation, share one slot, and the plain half
+/// is compressed again over the leftover. Removing first would lose the log
+/// outright.
 ///
-/// The permissions come across with the bytes. A log written 0600 because it
-/// carries something private stays 0600 once compressed; letting it default
-/// to whatever the umask allows would quietly widen it.
+/// The `sync_all` puts the compressed bytes on the disk before the unlink is
+/// issued. It does not order the two directory operations against each
+/// other, which would need `base.dir` fsynced as well, so it narrows that
+/// window rather than closing it.
+///
+/// Permissions come across with the bytes, and ahead of them. A log written
+/// 0600 because it carries something private stays 0600 once compressed.
 fn compress(path: &Path, target: &Path) -> Result<(), Error> {
     let mut source = fs::File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -136,10 +286,8 @@ fn compress(path: &Path, target: &Path) -> Result<(), Error> {
         })?
         .permissions();
 
-    let sink = fs::File::create(target).map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
+    let sink = create_with_permissions(target, permissions)?;
+
     let mut encoder = GzEncoder::new(sink, Compression::default());
     io::copy(&mut source, &mut encoder).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -149,14 +297,7 @@ fn compress(path: &Path, target: &Path) -> Result<(), Error> {
         path: target.to_path_buf(),
         source,
     })?;
-    // Durable before the plain copy goes, not merely written. Without this
-    // the remove can reach the disk first, and a power cut in between takes
-    // the log with it.
     sink.sync_all().map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(target, permissions).map_err(|source| Error::Io {
         path: target.to_path_buf(),
         source,
     })?;
@@ -744,5 +885,233 @@ mod tests {
         std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut out)
             .expect("decode");
         assert_eq!(out, body, "the partial stream was replaced, not appended");
+    }
+
+    #[test]
+    fn a_half_compressed_generation_takes_one_slot_not_two() {
+        // `X.log` and `X.log.gz` carry the SAME `Order`, so they are one
+        // generation wearing two files, not two generations. Giving them a
+        // slot each lets `keep` spare one of the two and delete the other,
+        // which deletes the whole generation while reporting that two
+        // survived. The twin state is not exotic: it is exactly what this
+        // module's own compress-then-remove ordering leaves behind on a
+        // crash, and the module documents recovering from it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = "the generation that keep = 2 promised to keep\n";
+        fs::write(dir.path().join("web-0-out.2026-08-20T15-04-01.log"), body).expect("seeded");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"),
+            "half a gzip stream",
+        )
+        .expect("seeded");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
+            "newest\n",
+        )
+        .expect("seeded");
+        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 2, true), &BTreeSet::new()).expect("tidied");
+
+        assert_eq!(tidied.compressed, 1, "one generation, one compression");
+        assert_eq!(tidied.deleted, 0, "two generations, and keep = 2");
+        assert!(
+            dir.path()
+                .join("web-0-out.2026-08-20T15-04-02.log")
+                .exists(),
+            "the newest survives"
+        );
+        let survivor = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        assert!(
+            survivor.exists(),
+            "and so does the older one keep = 2 promised"
+        );
+        let mut out = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(fs::File::open(&survivor).expect("open")),
+            &mut out,
+        )
+        .expect("decode");
+        assert_eq!(out, body, "with its bytes, not a leftover partial stream");
+    }
+
+    #[test]
+    fn a_half_compressed_generation_past_keep_is_removed_once_not_twice() {
+        // The same twin, this time doomed. Two slots for one generation
+        // means the same path is removed twice, and the second removal fails
+        // `NotFound` and aborts the pass. Every older generation then goes
+        // unpruned, on this tick and on every tick after it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-01.log"),
+            "doomed\n",
+        )
+        .expect("seeded");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"),
+            "half a gzip stream",
+        )
+        .expect("seeded");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
+            "newest\n",
+        )
+        .expect("seeded");
+        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+
+        let tidied = tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new())
+            .expect("the pass must not abort");
+
+        assert_eq!(tidied.deleted, 1, "one file left of one generation");
+        assert!(
+            dir.path()
+                .join("web-0-out.2026-08-20T15-04-02.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-01.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-01.log.gz")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn both_halves_of_a_half_compressed_generation_go_together() {
+        // With compression off nothing collapses the twin down to one file,
+        // so the generation is past `keep` while still wearing both. Sparing
+        // either half would leave a file that no later pass can ever reach:
+        // it would be the same one generation every time, and one generation
+        // is one slot.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        let gz = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        fs::write(&plain, "doomed\n").expect("seeded");
+        fs::write(&gz, "also doomed\n").expect("seeded");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
+            "newest\n",
+        )
+        .expect("seeded");
+        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 1, false), &BTreeSet::new()).expect("tidied");
+
+        assert_eq!(tidied.deleted, 2, "two files, one generation");
+        assert!(!plain.exists());
+        assert!(!gz.exists(), "no half left behind to leak forever");
+        assert!(
+            dir.path()
+                .join("web-0-out.2026-08-20T15-04-02.log")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_protected_path_spelled_with_a_parent_component_is_still_protected() {
+        // `PathBuf` equality normalises away `.` but not `..`, so comparing
+        // whole paths lets this spelling through the guard with nothing said
+        // about it. A guard that silently does nothing is worse than no
+        // guard, because the caller believes the file is safe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("sub")).expect("created");
+        for second in 1..=4 {
+            fs::write(
+                dir.path()
+                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+                format!("gen{second}\n"),
+            )
+            .expect("seeded");
+        }
+        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let spelled_the_long_way = dir
+            .path()
+            .join("sub")
+            .join("..")
+            .join("web-0-out.2026-08-20T15-04-01.log");
+        let protected = BTreeSet::from([spelled_the_long_way]);
+
+        let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
+
+        assert_eq!(tidied.skipped_protected, 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web-0-out.2026-08-20T15-04-01.log"))
+                .expect("survives"),
+            "gen1\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_path_through_a_symlinked_directory_is_still_protected() {
+        // A log directory reached through a symlink is the ordinary case,
+        // not a trick: /var/log is one on macOS. The caller and this module
+        // can easily be handed the two different spellings of the same
+        // directory, and the guard has to hold across them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("created");
+        let through = dir.path().join("through");
+        std::os::unix::fs::symlink(&real, &through).expect("linked");
+        for second in 1..=4 {
+            fs::write(
+                real.join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+                format!("gen{second}\n"),
+            )
+            .expect("seeded");
+        }
+        fs::write(real.join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&real.join("web-0-out.log")).expect("splits");
+        let protected = BTreeSet::from([through.join("web-0-out.2026-08-20T15-04-01.log")]);
+
+        let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
+
+        assert_eq!(tidied.skipped_protected, 1);
+        assert_eq!(
+            fs::read_to_string(real.join("web-0-out.2026-08-20T15-04-01.log")).expect("survives"),
+            "gen1\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compression_narrows_a_stale_gz_left_wide_by_an_earlier_crash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let private = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        fs::write(&private, "a token, probably\n").expect("seeded");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("chmod");
+        // The half-written `.gz` an earlier crash left, at the mode the
+        // umask happened to give it. Overwriting it must not inherit that.
+        let stale = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        fs::write(&stale, "half a gzip stream").expect("seeded");
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).expect("chmod");
+        fs::write(
+            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
+            "newest\n",
+        )
+        .expect("seeded");
+        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
+        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+
+        tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+
+        let mode = fs::metadata(&stale)
+            .expect("the compressed copy")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the source's mode wins, not the leftover's");
     }
 }
