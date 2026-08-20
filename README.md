@@ -154,11 +154,10 @@ along with everybody else's. That includes its own. Seeing
 log directory that is bounded except for four files is the surprising
 behaviour, not this.
 
-It does mean the dog has to be quiet, and it is. A pass that rotated nothing
-prints nothing at all. Only a pass that renamed something, refused to, or
-was refused a reopen prints its one line. If this dog logged a line per file
-per interval, its own log would be the busiest file in the directory it
-exists to keep small.
+It does mean the dog has to be quiet, and it is. Only a pass that renamed
+something, refused to, or was refused a reopen prints its one line. If this
+dog logged a line per file per interval, its own log would be the busiest
+file in the directory it exists to keep small.
 
 ## The window between rename and reopen
 
