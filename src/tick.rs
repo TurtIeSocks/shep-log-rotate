@@ -54,7 +54,7 @@ use crate::{
     config::{Config, Naming},
     error::Error,
     naming::{LogPath, match_generation},
-    prune::tidy,
+    prune::{resolve, tidy},
     rotate::rotate,
 };
 
@@ -400,16 +400,48 @@ fn normalise(path: &Path) -> PathBuf {
 ///   regular file, so a live log that is a symlink is invisible to it.
 ///
 /// It also costs one pass over `protected` instead of a `read_dir` per base.
+///
+/// The directory is resolved once, here, rather than per candidate: the
+/// comparison below needs it for every member of `protected`, and a
+/// `canonicalize` per member per base is a syscall count that grows with the
+/// square of a large flock.
 fn collides_with_a_live_log(base: &LogPath, naming: Naming, protected: &BTreeSet<PathBuf>) -> bool {
+    let resolved_dir = resolve(&base.dir);
     protected
         .iter()
-        .any(|path| is_generation_name_of(base, naming, path))
+        .any(|path| is_generation_name_of(base, &resolved_dir, naming, path))
 }
 
 /// Whether `candidate` is a name `base` rotates into, or shifts, under
-/// `naming`.
-fn is_generation_name_of(base: &LogPath, naming: Naming, candidate: &Path) -> bool {
-    if candidate.parent() != Some(base.dir.as_path()) {
+/// `naming`. `resolved_dir` is [`prune::resolve`] of `base.dir`.
+///
+/// The directory comparison resolves, exactly as [`prune::tidy`]'s own
+/// protection does, and for the reason that one gives: path equality
+/// normalises `.` away but not `..`, and it knows nothing about symlinks.
+/// Two sheep can be handed the same log directory under two spellings, one
+/// through a link and one not, and a raw comparison reads them as different
+/// directories.
+///
+/// Getting that wrong here is worse than getting it wrong in `tidy`, which
+/// is why both halves resolve rather than only the cheaper one. `tidy`
+/// declining to protect a file it should have costs a deletion, which is
+/// visible. This guard declining costs a rename of a file some other sheep
+/// has open, and shep goes on writing into an inode with no name: that
+/// sheep's log simply stops appearing, with nothing logged anywhere to say
+/// why. Measured against a real shepherd before this resolved: two sheep
+/// sharing one directory under two spellings, and one of them lost its live
+/// log to the other's rotation on the first tick.
+///
+/// The cheap comparison comes first, so the ordinary case where both sides
+/// were spelled the same way costs no syscall at all.
+fn is_generation_name_of(
+    base: &LogPath,
+    resolved_dir: &Path,
+    naming: Naming,
+    candidate: &Path,
+) -> bool {
+    let parent = candidate.parent().unwrap_or_else(|| Path::new(""));
+    if parent != base.dir.as_path() && resolve(parent) != resolved_dir {
         return false;
     }
     candidate
@@ -736,6 +768,54 @@ mod tests {
             "renaming a live log out from under an open descriptor is worse than deleting it"
         );
         assert!(grown.exists(), "the grown log is left for a human to sort");
+        assert!(fake.reopened.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_generation_slot_reached_through_a_symlinked_directory_is_still_left_alone() {
+        // The same collision, except the two sheep were handed the same
+        // directory under two spellings: one through a symlink and one not.
+        // Path equality reads those as different directories, so a guard
+        // comparing `candidate.parent()` to `base.dir` as written sees no
+        // collision at all and renames a file another sheep has open.
+        //
+        // Measured against a real shepherd before this resolved the
+        // directory: the rename went through on the first tick, and the
+        // sheep holding the open descriptor went on writing into an inode
+        // that no longer had a name.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("real");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let grown = link.join("web");
+        let live = real.join("web.1");
+        fs::write(&grown, "x".repeat(2048)).expect("seeded");
+        fs::write(&live, "one's live log\n").expect("seeded");
+        let fake = Fake {
+            config: "max_size = \"1K\"\nnaming = \"numeric\"\n".into(),
+            flock: vec![
+                sheep("web", Some(&grown), None),
+                sheep("one", Some(&live), None),
+            ],
+            reopen_fails: None,
+            reopened: RefCell::new(Vec::new()),
+        };
+
+        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+            .await
+            .expect("ticked");
+
+        assert_eq!(report.rotated, 0, "neither log may be renamed");
+        assert_eq!(
+            report.skipped_collision, 1,
+            "a symlinked directory is the same directory"
+        );
+        assert_eq!(
+            fs::read_to_string(&live).expect("still there"),
+            "one's live log\n"
+        );
         assert!(fake.reopened.borrow().is_empty());
     }
 

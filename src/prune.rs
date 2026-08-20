@@ -224,7 +224,14 @@ fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
 
 /// `canonicalize`, reading the empty path as the current directory and
 /// falling back to the path as written when it will not resolve.
-fn resolve(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` because [`tick`](crate::tick) asks the same question about
+/// the same directories, on the rename half of the same guard. Two answers
+/// to "is this the directory I think it is" is one more than a guard can
+/// have: the rename guard missing a spelling this one catches means the
+/// rename happens and the protection afterwards has nothing left to
+/// protect.
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     let path = if path.as_os_str().is_empty() {
         Path::new(".")
     } else {
