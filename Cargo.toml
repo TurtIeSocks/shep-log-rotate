@@ -1,6 +1,6 @@
 [package]
 name = "shep-log-rotate"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A log-rotation dog for shep: renames grown logs, asks the shepherd to reopen, then compresses and prunes"
@@ -25,7 +25,7 @@ integration = []
 #
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
-shep-client = "0.1.0-alpha.1"
+shep-client = "0.1.0"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

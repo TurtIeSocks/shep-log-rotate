@@ -798,9 +798,9 @@ dependencies = [
 
 [[package]]
 name = "shep-client"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7145acf2e4e9c539c60cdff87eacee700a19ee1f988ece836f364c1f4437cc17"
+checksum = "3b98c6779c787ea54f6ba54b3d091f6ce09fdb910a10aae32729623b292c8281"
 dependencies = [
  "futures-util",
  "shep-core",
@@ -811,9 +811,9 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bfc51e9b687cebe614d78d96189891fddfda79986ed6a2089c160cc0c06648a"
+checksum = "3e7412a1a7454d58d7d5c03264896bac43e5103f5081e224fc94835b9605bdad"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "shep-log-rotate"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "jiff",

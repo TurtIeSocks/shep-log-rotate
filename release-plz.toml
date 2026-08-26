@@ -27,8 +27,9 @@
 # is a changelog PR.
 
 [workspace]
-# Marks a GitHub release as a pre-release when the version says so, which
-# `0.1.0-alpha.1` does.
+# Marks a GitHub release as a pre-release when the version carries a SemVer
+# pre-release tag. 0.1.0 does not, so this is inert today; it is kept for the
+# next time a version does.
 git_release_type = "auto"
 
 # No `[[package]]` sections: one crate, nothing to group or exclude.

@@ -19,15 +19,8 @@ uses.
 ## Install
 
 ```sh
-cargo install shep-log-rotate --version 0.1.0-alpha.1
+cargo install shep-log-rotate
 shep adopt log-rotate ~/.cargo/bin/shep-log-rotate
-```
-
-The version is required while this is an alpha. cargo skips pre-releases
-unless you name one, so a bare `cargo install shep-log-rotate` fails:
-
-```text
-error: could not find `shep-log-rotate` in registry `crates-io` with version `*`
 ```
 
 `shep adopt` records the binary in `shep.toml` and starts it. From then on
