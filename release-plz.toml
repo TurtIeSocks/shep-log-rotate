@@ -1,0 +1,34 @@
+# release-plz owns the changelog and the version bump. It does NOT publish.
+#
+# Same split as shep's, and for the same reason: `release-plz release-pr`
+# opens a pull request that bumps the version and writes the changelog from
+# the conventional commits since the last release, and the upload stays in
+# `.github/workflows/release.yml` behind a `v*` tag, a tag-versus-manifest
+# check and a `crates-io` environment. Publishing is the one action here that
+# cannot be undone, and a push to `main` is an easier bar to clear by accident
+# than a tag.
+#
+# To hand release-plz the whole job later: add the `release-plz-release` job
+# from https://release-plz.dev/docs/github/quickstart and DELETE
+# `.github/workflows/release.yml`, or both will try to publish the same
+# version.
+#
+# ## Two things specific to this crate
+#
+# It cannot publish at all until `shep-client` is on crates.io. The dependency
+# carries a version alongside its git URL so packaging works, but the registry
+# refuses an upload whose dependency is not on the index. shep first, then
+# this.
+#
+# And this crate is on a pre-release version. release-plz publishes one fine
+# and marks it as such on GitHub, but it has no automated path from
+# `-alpha.1` to `-alpha.2` to `-beta.0` to stable; the maintainer said so in
+# discussion #2443. So for now the version is set by hand and the release PR
+# is a changelog PR.
+
+[workspace]
+# Marks a GitHub release as a pre-release when the version says so, which
+# `0.1.0-alpha.1` does.
+git_release_type = "auto"
+
+# No `[[package]]` sections: one crate, nothing to group or exclude.
