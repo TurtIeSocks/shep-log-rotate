@@ -200,9 +200,16 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` depends on `shep-client` by git URL rather than by version. No
-shep crate is published on crates.io yet. When one is, this becomes a
-version and the git line goes away.
+`Cargo.toml` names `shep-client` with both a version and a git URL. Cargo
+builds from git, so this tracks shep's `main`, and the version is there
+because `cargo package` refuses a dependency without one. No shep crate is on
+crates.io yet, so this crate cannot be published until one is; when that
+happens the git and branch keys come out and nothing else changes.
+
+Depending on the published surface rather than on a path is the point, not an
+accident. This project exists partly to find out whether somebody outside
+shep's own workspace can build a dog with what shep publishes, and a path
+dependency would quietly paper over anything missing from it.
 
 ## License
 

@@ -1,6 +1,6 @@
 [package]
 name = "shep-log-rotate"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A log-rotation dog for shep: renames grown logs, asks the shepherd to reopen, then compresses and prunes"
@@ -16,7 +16,17 @@ categories = ["command-line-utilities"]
 integration = []
 
 [dependencies]
-shep-client = { git = "https://github.com/TurtIeSocks/shep", branch = "main" }
+# Version AND git, deliberately, until shep is on crates.io.
+#
+# Cargo uses the git source to build, so this tracks shep's main the way it
+# has all along. But `cargo package` refuses a dependency with no version
+# requirement, so without the version this crate cannot be published at all,
+# and finding that out on publish day is the wrong time.
+#
+# When shep-client is published, delete the git and branch keys. Nothing else
+# about this line changes, and the lockfile is what proves which source was
+# actually used.
+shep-client = { version = "0.1.0-alpha.1", git = "https://github.com/TurtIeSocks/shep", branch = "main" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
