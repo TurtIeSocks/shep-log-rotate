@@ -1,19 +1,25 @@
 name: release-plz
-# Opens and maintains a release pull request: the version bump and the
-# changelog, written from the conventional commits since the last release.
+# Opens the release pull request, and publishes when it merges.
 #
-# It does NOT publish. The `release-plz-release` job from release-plz's
-# quickstart is deliberately absent, because `.github/workflows/release.yml`
-# owns the upload behind a `v*` tag. Adding it here without deleting that file
-# means two workflows racing to publish the same version. See release-plz.toml.
+# `release-pr` maintains a pull request that bumps the version from the
+# conventional commits since the last release. `release` runs after that PR
+# merges: it tags the commit, creates the GitHub release, and uploads to
+# crates.io.
+#
+# This replaced a hand-written release.yml that published behind a `v*` tag.
+# release-plz.toml records why that split was wrong.
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: [test]
+    types: [completed]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   release-pr:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -27,6 +33,10 @@ jobs:
           # release-plz reads the commits since the last release tag, so a
           # shallow clone gives it nothing to write a changelog from.
           fetch-depth: 0
+          # release-plz pushes commits, branches and tags over the GitHub
+          # API, not the git CLI, so the checkout's own token never needs to
+          # persist.
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       # Pinned by commit, not by tag. This action is handed contents:write
       # and pull-requests:write, and a tag is mutable, so pinning the tag
@@ -39,4 +49,103 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           # Read-only here: `release-pr` does not upload, but release-plz uses
           # the registry to work out which versions are already published.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Fires when `test.yml` finishes, not when `main` moves. `workflow_run` is
+  # what lets this job require a fact about the commit (its test result)
+  # instead of racing to find one out. Triggering both off `push` would only
+  # mean "alongside", never "after".
+  #
+  # Every clause below is load-bearing, and two are there for security rather
+  # than ordering. A `workflow_run` job runs in the BASE repository's context:
+  # base secrets, base environments, base token. So it has to establish that
+  # the run came from this repository and from a push.
+  #
+  #   event == 'push'                    `test.yml` also runs on
+  #                                      `pull_request` and
+  #                                      `workflow_dispatch`, and both fire
+  #                                      this event too.
+  #   head_repository == this repository a fork's `head_branch` is the FORK's
+  #                                      branch name, so a fork branch named
+  #                                      `main` satisfies the clause below on
+  #                                      its own. Without this line, opening a
+  #                                      pull request from such a fork starts
+  #                                      this job on the fork's commit with
+  #                                      CARGO_REGISTRY_TOKEN in scope.
+  #   head_branch == 'main'              the release branch, once the two
+  #                                      above have settled whose `main`.
+  #   conclusion == 'success'            the matrix passed, not merely ended.
+  release:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.name == 'test' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # An environment, so a required reviewer can be added here later if this
+    # ever wants a human gate between merging and spending a version number.
+    environment: crates-io
+    permissions:
+      contents: write
+      # With `release_always = false`, release-plz reads pull request state to
+      # tell whether the commit it is looking at came from a merged release
+      # PR.
+      pull-requests: read
+    concurrency:
+      group: release-plz-release-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit test.yml reported on, not whatever main points at by
+          # the time this job starts. `workflow_run` always evaluates the
+          # workflow FILE off the default branch, but the commit it reports a
+          # result for is a fact about the past, and main can move again in
+          # between.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Checking out a bare SHA leaves HEAD detached, and release-plz resolves
+      # `@{upstream}` to work out which branch it is releasing. On a detached
+      # HEAD that fails and the job dies before publishing anything, which
+      # looks identical to a gate that is working.
+      - name: Put the tested commit back on a branch
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git switch --force-create main "$TESTED_SHA"
+          git branch --set-upstream-to=origin/main main
+      # release-plz 0.3.160, which is the CLI the action below actually runs,
+      # does not necessarily release the commit it was handed. On a MERGE
+      # commit its `should_release` finds the associated pull request, takes
+      # that PR's last commit P, runs `git branch --contains P`, and on a hit
+      # checks P out into this working directory. `cargo publish` then
+      # packages from that same directory, so the tarball is built from P, not
+      # from the commit test.yml passed.
+      #
+      # Squash and rebase merges do not hit this: the merged commit is new,
+      # the branch is deleted, `git branch --contains` finds nothing, and
+      # release-plz releases what is checked out.
+      #
+      # `release_always = false` does NOT protect against this. It governs
+      # only the branch where no associated PR is found at all.
+      - name: Refuse to publish from a merge commit
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          parents="$(git rev-list --parents -n 1 "$TESTED_SHA" | wc -w)"
+          if [ "$parents" -gt 2 ]; then
+            echo "::error::$TESTED_SHA is a merge commit, and release-plz 0.3.160 would publish the release PR's head commit instead of this one. Re-merge the release pull request with squash or rebase."
+            exit 1
+          fi
+      - run: rustup toolchain install stable --profile minimal
+      # Same pin as the job above, for the same reason.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
