@@ -1,6 +1,6 @@
 [package]
 name = "shep-log-rotate"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 rust-version = "1.88"
 description = "A log-rotation dog for shep: renames grown logs, asks the shepherd to reopen, then compresses and prunes"
