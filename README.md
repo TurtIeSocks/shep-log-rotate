@@ -1,5 +1,10 @@
 # shep-log-rotate
 
+[![Crates.io Version](https://img.shields.io/crates/v/shep-log-rotate.svg)](https://crates.io/crates/shep-log-rotate)
+[![License](https://img.shields.io/crates/l/shep-log-rotate.svg)](https://github.com/TurtIeSocks/shep-log-rotate#license)
+[![MSRV](https://img.shields.io/crates/msrv/shep-log-rotate.svg)](https://crates.io/crates/shep-log-rotate)
+[![CI](https://github.com/TurtIeSocks/shep-log-rotate/actions/workflows/test.yml/badge.svg)](https://github.com/TurtIeSocks/shep-log-rotate/actions/workflows/test.yml)
+
 A log-rotation dog for [shep](https://github.com/TurtIeSocks/shep).
 
 shep writes each sheep's stdout and stderr to a file and appends forever.

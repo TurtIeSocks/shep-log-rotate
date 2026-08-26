@@ -1,0 +1,79 @@
+name: test
+# Mirrors shep's own workflow in shape, scaled to one crate. shep runs twelve
+# jobs across five platforms because it ships a daemon; this ships one binary
+# that talks to one, so most of that matrix would be spending minutes to learn
+# nothing.
+#
+# The `integration` job is the exception and the reason this file exists at
+# all. Every other job here would pass on a dog that cannot actually talk to a
+# shepherd.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      # `--all-targets` reaches the integration tier's own source, which is
+      # feature-gated off by default and would otherwise go unlinted until
+      # somebody enabled it.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo doc --no-deps --all-features
+    env:
+      RUSTDOCFLAGS: -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test --locked
+      # Both platforms, because this dog is filesystem code and the two
+      # disagree about things it depends on: case sensitivity in the name
+      # matcher, and what `rename` does over an existing file.
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Matches `rust-version` in Cargo.toml, which matches shep's. A dog that
+      # needs a newer compiler than the daemon it serves is a bad example.
+      - run: rustup toolchain install 1.88 --profile minimal
+      - run: cargo +1.88 check --all-targets --all-features --locked
+
+  integration:
+    # The tier that drives a real shepherd, and the only job that tests what
+    # this project is for. It is feature-gated off by default because a fresh
+    # clone has no `shep` binary; here we build one.
+    #
+    # Installed from shep's `main` rather than from the revision this crate's
+    # lockfile pins, deliberately. The point of an external dog is to notice
+    # when shep's published surface moves under it, and pinning would hide
+    # exactly that. A red job here is a real signal, not flakiness.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - name: Build a real shep
+        run: cargo install --git https://github.com/TurtIeSocks/shep --branch main --bin shep --locked
+      - name: Run the integration tier against it
+        run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
