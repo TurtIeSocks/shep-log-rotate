@@ -40,3 +40,24 @@
 git_release_type = "auto"
 
 # No `[[package]]` sections: one crate, nothing to group or exclude.
+
+# release-plz's own default is true, which would have `release` try to publish
+# on every push to main whenever Cargo.toml names an unpublished version, not
+# only after a release PR merges. That is wider than "merging the release PR
+# is the publish", so it is turned off explicitly rather than left at the
+# default. shep sets the same.
+#
+# Know the trap this creates before merging a version bump. release-plz
+# decides a commit "came from a release PR" by checking that the PR's BRANCH
+# starts with `release-plz-`, not by its title. A version bump merged from a
+# branch named anything else leaves the version stranded: bumped in
+# Cargo.toml, absent from crates.io, and unreachable until some later
+# `release-plz-` merge lands. shep stranded 0.1.1 exactly this way on
+# 2026-08-26. The docs' own advice is to name such a branch `release-plz-fix-ci`
+# or similar.
+#
+# This does NOT narrow the merge-commit substitution described in
+# .github/workflows/release-plz.yml. It governs only the case where no
+# associated PR is found at all, so requiring a release PR routes into that
+# path rather than around it. The workflow refuses merge commits for that.
+release_always = false
