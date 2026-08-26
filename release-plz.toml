@@ -1,18 +1,25 @@
-# release-plz owns the changelog and the version bump. It does NOT publish.
+# release-plz owns the changelog, the version bump, the tag, the GitHub
+# release and the upload.
 #
-# Same split as shep's, and for the same reason: `release-plz release-pr`
-# opens a pull request that bumps the version and writes the changelog from
-# the conventional commits since the last release, and the upload stays in
-# `.github/workflows/release.yml` behind a `v*` tag, a tag-versus-manifest
-# check and a `crates-io` environment. Publishing is the one action here that
-# cannot be undone, and a push to `main` is an easier bar to clear by accident
-# than a tag.
+# ## This used to be split, and the split was wrong
 #
-# To hand release-plz the whole job later: add the `release-plz-release` job
-# from https://release-plz.dev/docs/github/quickstart and DELETE
-# `.github/workflows/release.yml`, or both will try to publish the same
-# version.
+# Until 2026-08-26 this ran `release-pr` only, and a hand-written
+# .github/workflows/release.yml published behind a `v*` tag. The reason given
+# was that publishing cannot be undone and a push to main is an easier bar to
+# clear by accident than a tag.
 #
+# That has the risk backwards. Publishing under the standard setup means
+# merging a pull request TITLED "chore: release vX.Y.Z", which is a reviewed,
+# named, visible artifact. Pushing a tag is a command someone types.
+#
+# shep hit the consequence the same day this was written: its release PR was
+# merged, nothing published, and main sat a version ahead of crates.io waiting
+# on a step nobody knew was missing. This repository had the identical split
+# and would have surprised its first releaser the same way.
+#
+# The `crates-io` environment survives the move, so a required reviewer can
+# still be added there if this ever wants a human gate.
+
 # ## Two things specific to this crate
 #
 # It cannot publish at all until `shep-client` is on crates.io. The dependency

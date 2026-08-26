@@ -1,11 +1,13 @@
 name: release-plz
-# Opens and maintains a release pull request: the version bump and the
-# changelog, written from the conventional commits since the last release.
+# Opens the release pull request, and publishes when it merges.
 #
-# It does NOT publish. The `release-plz-release` job from release-plz's
-# quickstart is deliberately absent, because `.github/workflows/release.yml`
-# owns the upload behind a `v*` tag. Adding it here without deleting that file
-# means two workflows racing to publish the same version. See release-plz.toml.
+# `release-pr` maintains a pull request that bumps the version from the
+# conventional commits since the last release. `release` runs after that PR
+# merges: it tags the commit, creates the GitHub release, and uploads to
+# crates.io.
+#
+# This replaced a hand-written release.yml that published behind a `v*` tag.
+# release-plz.toml records why that split was wrong.
 on:
   push:
     branches: [main]
@@ -39,4 +41,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           # Read-only here: `release-pr` does not upload, but release-plz uses
           # the registry to work out which versions are already published.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Runs on every push to main, and does nothing unless Cargo.toml names a
+  # version that is not on crates.io. That is what makes merging the release
+  # PR the act that publishes: the merge is the only thing that moves the
+  # version.
+  release:
+    runs-on: ubuntu-latest
+    # An environment, so a required reviewer can be added here later if this
+    # ever wants a human gate between merging and spending a version number.
+    environment: crates-io
+    permissions:
+      contents: write
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install stable --profile minimal
+      # Same pin as the job above, for the same reason.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
