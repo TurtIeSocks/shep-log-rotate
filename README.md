@@ -19,7 +19,7 @@ uses.
 ## Install
 
 ```sh
-cargo install --git https://github.com/TurtIeSocks/shep-log-rotate
+cargo install shep-log-rotate
 shep adopt log-rotate ~/.cargo/bin/shep-log-rotate
 ```
 
