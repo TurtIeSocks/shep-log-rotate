@@ -1,25 +1,56 @@
 # release-plz owns the changelog, the version bump, the tag, the GitHub
-# release and the upload.
+# release and the upload. Merging the release pull request is the whole
+# release, and since 2026-08-27 even that merge is automatic.
 #
-# ## This used to be split, and the split was wrong
+# ## Rewritten on 2026-08-27 to match zendriver-rs
 #
-# Until 2026-08-26 this ran `release-pr` only, and a hand-written
-# .github/workflows/release.yml published behind a `v*` tag. The reason given
-# was that publishing cannot be undone and a push to main is an easier bar to
-# clear by accident than a tag.
+# Rin's call: zendriver-rs's setup is the one to copy, across shep and both
+# dogs. What that changed here:
 #
-# That has the risk backwards. Publishing under the standard setup means
-# merging a pull request TITLED "chore: release vX.Y.Z", which is a reviewed,
-# named, visible artifact. Pushing a tag is a command someone types.
+#   changelog_update    unset -> true, with an explicit template. It was
+#                       already defaulting to true; what is new is
+#                       release-plz-changelog.toml, which skips docs, test,
+#                       ci, chore and style commits so a generated section
+#                       stays short and reads like a hand-written one. Two
+#                       survive those skips on purpose: release-plz's own
+#                       `chore: update Cargo.toml dependencies`, parsed before
+#                       the generic chore skip and grouped under Internal, and
+#                       anything marked breaking, which
+#                       `protect_breaking_commits` keeps regardless.
+#   release_always      false -> unset (release-plz's default, true). See
+#                       below; this one was actively dangerous.
+#   semver_check        unset -> true. cargo-semver-checks against the
+#                       published version, so an accidental breaking change
+#                       fails the release PR rather than shipping in a patch.
+#   git_release_enable  unset -> true. Was already the default; stated so it
+#                       survives a future default change.
+#   publish_no_verify   new, false. Also the default. Stated because the
+#                       opposite skips the pre-upload build, and an upload
+#                       cannot be undone.
 #
-# shep hit the consequence the same day this was written: its release PR was
-# merged, nothing published, and main sat a version ahead of crates.io waiting
-# on a step nobody knew was missing. This repository had the identical split
-# and would have surprised its first releaser the same way.
+# ## Why release_always = false had to go
 #
-# The `crates-io` environment survives the move, so a required reviewer can
-# still be added there if this ever wants a human gate.
-
+# This file used to carry a long warning about it, and the warning was right
+# about the trap without drawing the conclusion. release-plz decides a commit
+# "came from a release PR" by checking that the PR's BRANCH starts with
+# `release-plz-`, not by its title. A version bump merged from a branch named
+# anything else leaves the version stranded: bumped in Cargo.toml, absent from
+# crates.io, unreachable until some later `release-plz-` merge lands.
+#
+# shep stranded 0.1.1 that way on 2026-08-26 and 0.1.7 again on 2026-08-27,
+# the second time with no path forward that did not involve editing the
+# workflow. A setting whose documented failure mode is "the release silently
+# does not happen and cannot be made to happen" is not a safety feature.
+# release-plz's default publishes whenever the manifest names an unpublished
+# version, which cannot deadlock that way.
+#
+# What replaced it is not in this file. The `main` ruleset requires lint,
+# docs, msrv, integration and the test matrix, so an untested commit cannot
+# reach main to be published in the first place. The `workflow_run` gate in
+# the old .github/workflows/release-plz.yml did that job before the ruleset
+# existed. Delete the ruleset without restoring that gate and crates.io
+# publishes whatever lands on main.
+#
 # ## Two things specific to this crate
 #
 # It cannot publish at all until `shep-client` is on crates.io. The dependency
@@ -27,37 +58,21 @@
 # refuses an upload whose dependency is not on the index. shep first, then
 # this.
 #
-# And this crate is on a pre-release version. release-plz publishes one fine
-# and marks it as such on GitHub, but it has no automated path from
-# `-alpha.1` to `-alpha.2` to `-beta.0` to stable; the maintainer said so in
-# discussion #2443. So for now the version is set by hand and the release PR
-# is a changelog PR.
+# And release-plz has no automated path from `-alpha.1` to `-alpha.2` to
+# `-beta.0` to stable; the maintainer said so in discussion #2443. While this
+# crate is on a pre-release, its version is set by hand.
 
 [workspace]
 # Marks a GitHub release as a pre-release when the version carries a SemVer
 # pre-release tag. 0.1.0 does not, so this is inert today; it is kept for the
 # next time a version does.
 git_release_type = "auto"
+git_release_enable = true
+
+changelog_update = true
+changelog_config = "release-plz-changelog.toml"
+
+semver_check = true
+publish_no_verify = false
 
 # No `[[package]]` sections: one crate, nothing to group or exclude.
-
-# release-plz's own default is true, which would have `release` try to publish
-# on every push to main whenever Cargo.toml names an unpublished version, not
-# only after a release PR merges. That is wider than "merging the release PR
-# is the publish", so it is turned off explicitly rather than left at the
-# default. shep sets the same.
-#
-# Know the trap this creates before merging a version bump. release-plz
-# decides a commit "came from a release PR" by checking that the PR's BRANCH
-# starts with `release-plz-`, not by its title. A version bump merged from a
-# branch named anything else leaves the version stranded: bumped in
-# Cargo.toml, absent from crates.io, and unreachable until some later
-# `release-plz-` merge lands. shep stranded 0.1.1 exactly this way on
-# 2026-08-26. The docs' own advice is to name such a branch `release-plz-fix-ci`
-# or similar.
-#
-# This does NOT narrow the merge-commit substitution described in
-# .github/workflows/release-plz.yml. It governs only the case where no
-# associated PR is found at all, so requiring a release PR routes into that
-# path rather than around it. The workflow refuses merge commits for that.
-release_always = false

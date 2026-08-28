@@ -73,7 +73,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
+      # The bare `shep` before the flags is the package spec, and it is load
+      # bearing. `cargo install --git` searches the whole repository for any
+      # Cargo.toml, and shep's workspace grew a second binary-carrying member,
+      # shep-examples, which made the command ambiguous:
+      # "multiple packages with binaries found: shep, shep-examples".
+      # `--bin shep` does not disambiguate that; it selects a binary within a
+      # package that has already been chosen.
       - name: Build a real shep
-        run: cargo install --git https://github.com/TurtIeSocks/shep --branch main --bin shep --locked
+        run: cargo install --git https://github.com/TurtIeSocks/shep --branch main shep --bin shep --locked
       - name: Run the integration tier against it
         run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
