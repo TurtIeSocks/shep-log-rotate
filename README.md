@@ -14,7 +14,8 @@ older generations so the log directory stays bounded.
 
 It is an external dog. Nothing here is built into shep: it is an ordinary
 binary you adopt, and it talks to the daemon over the same socket the CLI
-uses.
+uses. [shep-deploy](https://github.com/TurtIeSocks/shep-deploy) is the other
+one, and has the same shape.
 
 ## Install
 
@@ -205,16 +206,19 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` names `shep-client` with both a version and a git URL. Cargo
-builds from git, so this tracks shep's `main`, and the version is there
-because `cargo package` refuses a dependency without one. No shep crate is on
-crates.io yet, so this crate cannot be published until one is; when that
-happens the git and branch keys come out and nothing else changes.
+`Cargo.toml` names `shep-client` by version alone, from crates.io. It carried
+a git URL alongside until shep published on 2026-08-26, which was the only
+thing blocking this crate from being published itself.
 
 Depending on the published surface rather than on a path is the point, not an
 accident. This project exists partly to find out whether somebody outside
 shep's own workspace can build a dog with what shep publishes, and a path
 dependency would quietly paper over anything missing from it.
+
+For the same reason CI does not test against the `shep-client` this crate
+pins. Its `integration` job installs `shep` from the tip of `main` and drives
+a real shepherd with it, so a change to shep's published behaviour turns this
+repository red rather than being discovered by an operator.
 
 ## License
 
