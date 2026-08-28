@@ -14,27 +14,29 @@ older generations so the log directory stays bounded.
 
 It is an external dog. Nothing here is built into shep: it is an ordinary
 binary you adopt, and it talks to the daemon over the same socket the CLI
-uses.
+uses. [shep-deploy](https://github.com/TurtIeSocks/shep-deploy) is the other
+one, and has the same shape.
 
 ## Install
 
 ```sh
 cargo install shep-log-rotate
-shep adopt log-rotate ~/.cargo/bin/shep-log-rotate
+shep adopt shep-log-rotate
 ```
 
 `shep adopt` records the binary in `shep.toml` and starts it. From then on
 the shepherd supervises it like anything else in the flock, and `shep dogs`
 lists it.
 
-The name you adopt it under is the name it looks itself up by, and it is
-also the config key. Adopt it as `log-rotate` and it reads
-`[dog.log-rotate]`; adopt it as `rotator` and it reads `[dog.rotator]`. Any
+The name it is adopted under is the name it looks itself up by, and it is also
+the config key. `--name` sets it, and defaults to the binary's file stem with a
+leading `shep-` stripped, so the command above lands on `log-rotate` and reads
+`[dog.log-rotate]`. Pass `--name rotator` and it reads `[dog.rotator]`. Any
 name works, as long as the section matches.
 
-Be careful with that second command, though. `shep adopt` checks that a
-binary is runnable by actually running it, for about fifty milliseconds,
-with your shell's environment. If `$SHEP_HOME` is not set in that shell,
+Be careful with that second command, though. `shep adopt` checks that a binary
+is runnable by actually running it, for about fifty milliseconds, with your
+shell's environment. If `$SHEP_HOME` is not set in that shell,
 the copy it starts connects to your default shepherd at `~/.shep` and may
 get a rotation pass in there before it is killed. That is usually what you
 want. If it is not, set `$SHEP_HOME` for the `adopt` command as well as
@@ -205,16 +207,27 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` names `shep-client` with both a version and a git URL. Cargo
-builds from git, so this tracks shep's `main`, and the version is there
-because `cargo package` refuses a dependency without one. No shep crate is on
-crates.io yet, so this crate cannot be published until one is; when that
-happens the git and branch keys come out and nothing else changes.
+`Cargo.toml` line 28 reads `shep-client = "0.1.0"`, by version alone, from
+crates.io. It carried a git URL alongside until shep published on 2026-08-26,
+which was the only thing blocking this crate from being published itself. Three
+stable versions of this crate have gone out since, plus one alpha.
+
+That requirement is a floor, not a pin. Cargo reads it as `^0.1.0` and would
+take any `0.1.x`. `Cargo.lock` holds it at `0.1.0` and `0.1.7` is the newest
+published, so what builds here today is the oldest client that satisfies the
+requirement.
 
 Depending on the published surface rather than on a path is the point, not an
 accident. This project exists partly to find out whether somebody outside
 shep's own workspace can build a dog with what shep publishes, and a path
 dependency would quietly paper over anything missing from it.
+
+CI tests that pairing rather than assuming it. The `integration` job builds
+this crate against the locked `shep-client`, then installs the `shep` binary
+from the tip of shep's `main` and drives a real shepherd with it. So what is
+under test is the oldest supported client against shep's unreleased daemon,
+which is the widest the gap between the two can get, and a change in shep turns
+this repository red rather than reaching an operator first.
 
 ## License
 
