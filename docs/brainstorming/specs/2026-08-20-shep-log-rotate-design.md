@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-20
 **Status:** delegate-mode design, awaiting Rin's review
-**Repo:** `github.com/TurtIeSocks/shep-log-rotate` (bare, README only)
+**Repo:** `github.com/shep-pm/shep-log-rotate` (bare, README only)
 
 ## The ask
 

@@ -81,6 +81,6 @@ jobs:
       # `--bin shep` does not disambiguate that; it selects a binary within a
       # package that has already been chosen.
       - name: Build a real shep
-        run: cargo install --git https://github.com/TurtIeSocks/shep --branch main shep --bin shep --locked
+        run: cargo install --git https://github.com/shep-pm/shep --branch main shep --bin shep --locked
       - name: Run the integration tier against it
         run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked

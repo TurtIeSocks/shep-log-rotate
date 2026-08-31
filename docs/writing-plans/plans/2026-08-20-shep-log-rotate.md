@@ -36,7 +36,7 @@ The design's section 1 calls for depending on the **published** `shep-client` fr
 **Use a git dependency on the public repository** for now:
 
 ```toml
-shep-client = { git = "https://github.com/TurtIeSocks/shep", branch = "main" }
+shep-client = { git = "https://github.com/shep-pm/shep", branch = "main" }
 ```
 
 This keeps almost all of the value. It resolves from outside the monorepo, against the same source a crates.io release would carry, with no path dependency anywhere. Verified working: a throwaway crate compiled `Client::connect`, `Request::{DogConfig, ListFlock, Reopen}`, `Response::DogSection`, `SelectorSpec::Name`, `ShepPaths::resolve`, and both `MemSize` and `UpDuration` parsers against it on a clean fetch.
@@ -92,7 +92,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A log-rotation dog for shep: renames grown logs, asks the shepherd to reopen, then compresses and prunes"
-repository = "https://github.com/TurtIeSocks/shep-log-rotate"
+repository = "https://github.com/shep-pm/shep-log-rotate"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["shep", "process-manager", "logrotate", "logging"]
@@ -104,7 +104,7 @@ categories = ["command-line-utilities"]
 integration = []
 
 [dependencies]
-shep-client = { git = "https://github.com/TurtIeSocks/shep", branch = "main" }
+shep-client = { git = "https://github.com/shep-pm/shep", branch = "main" }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
