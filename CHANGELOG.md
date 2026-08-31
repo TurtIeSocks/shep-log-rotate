@@ -17,13 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compare trees instead of banning merge commits
 
 
-## [0.1.1](https://github.com/TurtIeSocks/shep-log-rotate/compare/v0.1.0...v0.1.1) - 2026-08-26
+## [0.1.1](https://github.com/shep-pm/shep-log-rotate/compare/v0.1.0...v0.1.1) - 2026-08-26
 
 ### Other
 
-- let release-plz publish ([#3](https://github.com/TurtIeSocks/shep-log-rotate/pull/3))
+- let release-plz publish ([#3](https://github.com/shep-pm/shep-log-rotate/pull/3))
 
-## [0.1.0](https://github.com/TurtIeSocks/shep-log-rotate/releases/tag/v0.1.0) - 2026-08-26
+## [0.1.0](https://github.com/shep-pm/shep-log-rotate/releases/tag/v0.1.0) - 2026-08-26
 
 ### Added
 
