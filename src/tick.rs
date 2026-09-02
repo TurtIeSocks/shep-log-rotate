@@ -46,7 +46,7 @@ use std::{
 };
 
 use shep_client::{
-    Client,
+    LinkState, ReconnectingClient,
     shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec},
 };
 
@@ -465,16 +465,32 @@ fn is_generation_name_of(
 
 /// [`Daemon`] over a real connection to the shepherd.
 ///
-/// `Debug` is derived: the only thing in here is a [`Client`], whose own
-/// `Debug` prints its socket path and handshake ack and nothing else.
+/// A [`ReconnectingClient`] rather than a plain `Client`, because a dog
+/// outlives the daemon it connected to: shep hands over to a successor and
+/// the dog is still running with a dead socket in its hand. The reconnect
+/// is the client's own business, so nothing above this type reconnects.
+///
+/// `Debug` is derived: the only thing in here is the client, whose own
+/// `Debug` prints its socket path, the name it announced, its link state
+/// and the daemon's handshake ack, and nothing else.
 #[derive(Debug)]
-pub struct Live(Client);
+pub struct Live(ReconnectingClient);
 
 impl Live {
     /// Wrap a connected client.
     #[must_use]
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: ReconnectingClient) -> Self {
         Self(client)
+    }
+
+    /// What the client's supervisor is doing right now.
+    ///
+    /// On [`Daemon`] deliberately not: a fake has no connection to report
+    /// on, and the one caller that asks is the poll loop, which only ever
+    /// asks a real one. See `main::poll` for what it does with the answer.
+    #[must_use]
+    pub fn link(&self) -> LinkState {
+        self.0.link()
     }
 }
 

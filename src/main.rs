@@ -8,19 +8,30 @@
 //!
 //! # How it learns its own name
 //!
-//! The name matters because it is the `[dog.<name>]` key the configuration
-//! lives under, and getting it wrong is silent: the daemon answers
+//! Two names, from two places, and conflating them is how this went wrong
+//! once already. See [`Identity`].
+//!
+//! The handshake name is what goes in the `Hello` frame, and it comes from
+//! `$SHEP_DOG_NAME` and from nowhere else. shep sets it in the environment
+//! it spawns an adopted dog with, and the daemon records a handshake only
+//! for a connection that carries one. A dog that connects anonymously
+//! serves every request correctly and is still rendered `silent`, restarted
+//! once, and then declared stale and left down. There is nothing to guess
+//! at here, and guessing would be worse than not knowing: the name is also
+//! how the daemon decides which dog to act on when it refuses a handshake,
+//! so a borrowed name restarts somebody else's dog. No `$SHEP_DOG_NAME`
+//! means no shepherd spawned this process, and it connects without a name
+//! at all.
+//!
+//! The config name is the `[dog.<name>]` key the settings live under.
+//! Getting that one wrong is silent in its own way: the daemon answers
 //! `DogConfig` for a name nobody adopted with an empty section, which is
 //! byte for byte what a dog running on its defaults gets. Adopt this binary
 //! as `logrotate` when it asks for `log-rotate` and every setting in the
-//! operator's `shep.toml` is discarded without either side saying so.
-//!
-//! shep exports no name for a dog to read. An adopted dog is spawned with
-//! no arguments at all and exactly one environment entry, `SHEP_HOME`, so
-//! there is nothing in the process's own environment to read the name out
-//! of. What there is instead is the flock listing: it reports a pid per
-//! entry and a marker per dog, and this process knows its own pid. See
-//! [`adopted_name`].
+//! operator's `shep.toml` is discarded without either side saying so. It is
+//! the handshake name whenever there is one, and [`DEFAULT_NAME`] when
+//! there is not, because somebody running this binary by hand still wants
+//! their `shep.toml` read.
 
 #![forbid(unsafe_code)]
 
@@ -34,17 +45,28 @@ mod tick;
 use core::fmt;
 use std::{path::PathBuf, process::ExitCode, time::SystemTime};
 
-use shep_client::{Client, shep_core::paths::ShepPaths, shep_core::values::UpDuration};
+use shep_client::{
+    ConnectError, LinkState, ReconnectingClient, shep_core::paths::ShepPaths,
+    shep_core::values::UpDuration,
+};
 
 use crate::{
     config::{Config, PRINT_CONFIG},
     error::Error,
-    tick::{Daemon, Live, tick},
+    tick::{Live, tick},
 };
 
-/// The name to assume when the flock listing cannot say what this dog was
-/// adopted as. Documented in the README, so an operator following it lands
-/// on the name this constant already expects.
+/// The `[dog.<name>]` section to read when `$SHEP_DOG_NAME` is unset, which
+/// means nothing adopted this process and somebody is running the binary by
+/// hand.
+///
+/// A config-section default only. It is never announced in the handshake:
+/// see [`Identity`] for why the two names part company here rather than
+/// sharing one fallback.
+///
+/// It matches what `shep adopt shep-log-rotate` picks on its own, which the
+/// README documents, so an operator following the README lands on the
+/// section this constant already expects.
 const DEFAULT_NAME: &str = "log-rotate";
 
 /// Everything this binary accepts, printed when it is handed anything else.
@@ -63,8 +85,9 @@ Usage:
                                   exit.
 
 Settings are read from `shep.toml` over the shepherd's own socket, never
-from this process's arguments or environment. The socket comes from
-$SHEP_HOME, which the shepherd sets when it spawns this dog.";
+from this process's arguments. The environment supplies two things and no
+more: $SHEP_HOME names the socket, and $SHEP_DOG_NAME names the dog. The
+shepherd sets both when it spawns this dog.";
 
 /// What this process was asked to do.
 ///
@@ -130,90 +153,156 @@ impl Action {
     }
 }
 
-/// The name this process was adopted under, or `None` when the flock listing
-/// does not name it.
+/// The two names this dog needs, and the two different places they come
+/// from.
 ///
-/// The pid is the whole of the identification. It is sound because the
-/// shepherd spawns an adopted dog directly, so the pid it recorded is this
-/// process, and because a pid is unique among running processes. It is also
-/// the assumption most likely to be broken later by something entirely
-/// reasonable, such as a wrapper script or an interpreter mapping putting a
-/// shell between the shepherd and this binary, at which point the recorded
-/// pid is the wrapper's and this returns `None`. That is why the caller
-/// announces the fallback rather than taking it quietly, and why
-/// `tests/integration.rs` drives a real adoption under a name that is not
-/// the default: nothing else would ever tell you.
-///
-/// Errors are folded into `None` on purpose. Every caller's answer to "the
-/// shepherd would not say" is the same as its answer to "the shepherd did
-/// not know", and the tick that follows reports the connection failure
-/// itself.
-async fn adopted_name<D: Daemon>(daemon: &D) -> Option<String> {
-    let me = std::process::id();
-    daemon
-        .list_flock()
-        .await
-        .ok()?
-        .into_iter()
-        .find(|info| info.dog.is_some() && info.pid == Some(me))
-        .map(|info| info.name)
+/// Separate fields rather than one string, because they answer different
+/// questions and only one of them may be guessed at. The module docs have
+/// the argument; this type is what stops the code drifting back to one
+/// name for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Identity {
+    /// What to announce in the `Hello` frame, or `None` for a process no
+    /// shepherd spawned.
+    ///
+    /// Never falls back to [`DEFAULT_NAME`]. A name the daemon did not hand
+    /// out is a name it will act on anyway: a refused handshake is recorded
+    /// against whatever the frame said, so an invented one asks the daemon
+    /// to restart a dog that is running perfectly well.
+    handshake: Option<String>,
+    /// The `[dog.<name>]` section to read out of `shep.toml`.
+    section: String,
 }
 
-/// Connect, identify, and hand back both halves of a session.
+impl Identity {
+    /// Read both names out of the environment.
+    ///
+    /// Takes a lookup rather than reading [`std::env::var`] itself. The
+    /// environment is a process-wide mutable global, and a test that sets
+    /// one variable to check the absent case is a test that races every
+    /// other test in the binary.
+    ///
+    /// An empty `$SHEP_DOG_NAME` reads as unset. It cannot be a real dog:
+    /// `[dog.]` is not a section anybody can write, and an empty name in a
+    /// `Hello` frame is a handshake the daemon cannot attribute either.
+    fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
+        let handshake = env("SHEP_DOG_NAME").filter(|name| !name.is_empty());
+        let section = handshake.clone().unwrap_or_else(|| DEFAULT_NAME.to_owned());
+        Self { handshake, section }
+    }
+}
+
+/// Connect, announcing the handshake name when there is one.
 ///
-/// The name is looked up per connection rather than once at startup: a
-/// shepherd that restarted underneath this dog re-adopted it, and this is
-/// the moment to ask again rather than trust an answer from a daemon that is
-/// no longer running.
-async fn connect(socket: &std::path::Path) -> Result<(Live, String), Error> {
-    let live = Live::new(Client::connect(socket).await?);
-    let name = match adopted_name(&live).await {
-        Some(name) => name,
-        None => {
-            eprintln!(
-                "shep-log-rotate: the shepherd's flock listing does not name this process as a \
-                 dog, so it cannot tell what it was adopted as. Assuming {DEFAULT_NAME}, which \
-                 means [dog.{DEFAULT_NAME}] in shep.toml. Adopt it under a different name and \
-                 that section will be ignored."
-            );
-            DEFAULT_NAME.to_owned()
-        }
+/// The name is settled once, before the loop starts, rather than looked up
+/// per connection: it comes out of the environment shep spawned this
+/// process with, and a shepherd that restarted underneath the dog did not
+/// reach into that environment and rewrite it.
+async fn connect(socket: &std::path::Path, identity: &Identity) -> Result<Live, Error> {
+    let client = match &identity.handshake {
+        Some(name) => ReconnectingClient::connect_as_dog(socket, name).await?,
+        None => ReconnectingClient::connect(socket).await?,
     };
-    Ok((live, name))
+    Ok(Live::new(client))
+}
+
+/// Say why this dog is stopping, and hand back the code to stop with.
+///
+/// A refused handshake is protocol-version skew, and it is the one failure
+/// in here that waiting cannot fix: the daemon that refused is the only
+/// party that can, every later request on that connection fails, and the
+/// client's own supervisor has already given up rather than retrying it.
+/// Staying up would mean an infinite run of identical failures in the log
+/// this dog exists to keep small.
+///
+/// Exiting is also what makes the refusal actionable. The shepherd restarts
+/// a dog from its recorded path, and a skew usually means the binary at
+/// that path has already been replaced by the one that matches, so the
+/// restart is the fix rather than a retry of the same mistake.
+fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
+    eprintln!(
+        "shep-log-rotate: the shepherd refused this dog's handshake, and no amount of \
+         reconnecting fixes a protocol-version skew. The shepherd reports {}, and said: \
+         {message}. Exiting so it can restart this dog from disk.",
+        daemon_version.unwrap_or("no version")
+    );
+    ExitCode::FAILURE
 }
 
 /// The poll loop.
 ///
-/// Nothing in here is fatal except a signal. A failed tick is printed and
-/// retried on the next interval, because the shepherd restarting underneath
-/// a dog is ordinary rather than exceptional, and exiting would ask the
-/// supervisor to restart this process for a condition that resolves itself
-/// in a few seconds. A connection-shaped failure additionally drops the
-/// session, so the next pass reconnects.
+/// Nothing in here is fatal except a signal and a refused handshake. A
+/// failed tick is printed and retried on the next interval, because the
+/// shepherd restarting underneath a dog is ordinary rather than
+/// exceptional, and exiting would ask the supervisor to restart this
+/// process for a condition that resolves itself in a few seconds.
+///
+/// A connection-shaped failure no longer drops the session, which is the
+/// one thing that changed when [`Live`] started holding a reconnecting
+/// client. That client re-establishes its own connection on its own
+/// backoff, and requests issued while it is doing so fail rather than
+/// queueing, so a tick landing in that gap is precisely the failed tick
+/// this loop already retries. Dropping the session would abort a supervisor
+/// mid-backoff and replace it with an unsupervised first connection, which
+/// is strictly worse. The `Option` survives for the case it was always
+/// really about: the first connection, which nothing supervises and which
+/// fails whenever this dog is started before the socket exists.
 ///
 /// There is no signal handling beyond `ctrl_c`, which is the clean-exit path
 /// for an operator running this in a terminal. The shepherd owns this
 /// process's signals and its kill ladder. Rotation on `SIGHUP` is a shape
 /// people expect from `logrotate`, and adding it here would be arguing with
 /// the supervisor about who decides when this process does work.
-async fn poll(socket: &std::path::Path) -> ExitCode {
+async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
     // The interval to wait when there is no session to read one from. A
     // disconnected dog has no configuration either, so the default is the
     // only honest answer, and it is also the retry delay.
     let default_interval = Config::default().interval;
-    let mut session: Option<(Live, String)> = None;
+    let mut session: Option<Live> = None;
+
+    if identity.handshake.is_none() {
+        // Once, before the loop, rather than per connection: the answer
+        // cannot change while this process runs, and a dog whose socket is
+        // not up yet would otherwise print it on every retry.
+        //
+        // Loudly, because the two things it means are worth telling apart.
+        // Run by hand it is expected. Under a shepherd it means something
+        // stripped the environment between `shep adopt` and this process,
+        // and the daemon is about to call this dog silent and stop
+        // restarting it.
+        eprintln!(
+            "shep-log-rotate: $SHEP_DOG_NAME is not set, so nothing adopted this process. It \
+             will connect without naming itself, which the shepherd does not count as a \
+             handshake, and read [dog.{DEFAULT_NAME}] in shep.toml."
+        );
+    }
 
     loop {
         if session.is_none() {
-            match connect(socket).await {
-                Ok(connected) => session = Some(connected),
+            match connect(socket, identity).await {
+                Ok(live) => session = Some(live),
+                Err(Error::Connect(ConnectError::ProtocolMismatch {
+                    daemon_version,
+                    message,
+                    ..
+                })) => return refused(daemon_version.as_deref(), &message),
                 Err(err) => eprintln!("shep-log-rotate: {err}"),
             }
         }
 
         let mut interval = default_interval;
-        if let Some((live, name)) = &session {
-            match tick(live, name, SystemTime::now()).await {
+        if let Some(live) = &session {
+            // Before the tick rather than after a failed one, because a
+            // refused link answers every request with the same closed
+            // connection and the tick's error would say nothing about why.
+            if let LinkState::Refused {
+                daemon_version,
+                message,
+            } = live.link()
+            {
+                return refused(daemon_version.as_deref(), &message);
+            }
+            match tick(live, &identity.section, SystemTime::now()).await {
                 Ok((config, report)) => {
                     interval = config.interval;
                     // Silence on a quiet tick is the point, not tidiness:
@@ -224,12 +313,7 @@ async fn poll(socket: &std::path::Path) -> ExitCode {
                         println!("{line}");
                     }
                 }
-                Err(err) => {
-                    eprintln!("shep-log-rotate: {err}");
-                    if matches!(err, Error::Connect(_) | Error::Request(_)) {
-                        session = None;
-                    }
-                }
+                Err(err) => eprintln!("shep-log-rotate: {err}"),
             }
         }
 
@@ -288,7 +372,8 @@ async fn main() -> ExitCode {
         }
     };
     let paths = ShepPaths::resolve(&env, &home_dir);
-    poll(&paths.socket).await
+    let identity = Identity::from_env(env);
+    poll(&paths.socket, &identity).await
 }
 
 /// Compiles only when the `integration` feature is OFF, so a plain
@@ -308,50 +393,11 @@ fn heads_up_the_real_shepherd_tier_is_not_running() {
 mod tests {
     use super::*;
 
-    use shep_client::shep_core::{
-        protocol::{DogSource, ProcessInfo},
-        status::ProcStatus,
-    };
-
-    /// A [`Daemon`] that answers `list_flock` from a fixed listing and
-    /// nothing else. Every `adopted_name` question is a question about that
-    /// listing.
-    struct FlockFake(Vec<ProcessInfo>);
-
-    impl Daemon for FlockFake {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            Ok(String::new())
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            Ok(self.0.clone())
-        }
-        async fn reopen(&self, _name: &str) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-
-    /// A [`Daemon`] that cannot be reached.
-    struct Unreachable;
-
-    impl Daemon for Unreachable {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn reopen(&self, _name: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-    }
-
-    fn entry(id: u32, name: &str, pid: Option<u32>, dog: bool) -> ProcessInfo {
-        ProcessInfo::builder(id, name, ProcStatus::Online)
-            .pid(pid)
-            .dog(dog.then(|| DogSource::Adopted {
-                path: "/usr/local/bin/shep-log-rotate".to_owned(),
-            }))
-            .build()
+    /// An environment holding exactly one variable, which is the only one
+    /// [`Identity::from_env`] reads.
+    fn only(key: &str, value: &str) -> impl Fn(&str) -> Option<String> {
+        let (key, value) = (key.to_owned(), value.to_owned());
+        move |asked| (asked == key).then(|| value.clone())
     }
 
     #[test]
@@ -390,46 +436,46 @@ mod tests {
         assert!(usage.contains("--print-config"), "{usage}");
     }
 
-    #[tokio::test]
-    async fn the_dog_finds_the_name_it_was_adopted_under() {
+    #[test]
+    fn the_dog_takes_both_names_from_shep_dog_name() {
         // Not the default name, because the default name is exactly what a
         // broken lookup falls back to.
-        let flock = FlockFake(vec![
-            entry(0, "web", Some(std::process::id() + 1), false),
-            entry(1, "weathervane", Some(std::process::id()), true),
-        ]);
+        let identity = Identity::from_env(only("SHEP_DOG_NAME", "weathervane"));
+        assert_eq!(identity.handshake.as_deref(), Some("weathervane"));
         assert_eq!(
-            adopted_name(&flock).await.as_deref(),
-            Some("weathervane"),
-            "the entry with this process's pid is this process"
+            identity.section, "weathervane",
+            "the section follows the adopted name, so [dog.weathervane] is what gets read"
         );
     }
 
-    #[tokio::test]
-    async fn a_sheep_sharing_this_pid_is_not_this_dog() {
-        // A pid match alone is not identification. The listing reports one
-        // pid per entry, and only a dog entry can be this process; a sheep
-        // wearing the same number would mean the shepherd handed out a pid
-        // it does not own, and adopting its name would read somebody else's
-        // config section.
-        let flock = FlockFake(vec![entry(0, "web", Some(std::process::id()), false)]);
-        assert_eq!(adopted_name(&flock).await, None);
+    #[test]
+    fn without_shep_dog_name_the_dog_names_itself_to_nobody() {
+        // The half that matters. A dog nothing adopted must send no name at
+        // all: a guessed one is recorded against a real dog, and the daemon
+        // restarts that one when this connection is refused.
+        let identity = Identity::from_env(|_| None);
+        assert_eq!(identity.handshake, None);
+        assert_eq!(
+            identity.section, DEFAULT_NAME,
+            "a hand run still reads a section, and this is the one the README documents"
+        );
     }
 
-    #[tokio::test]
-    async fn a_dog_at_another_pid_is_not_this_dog() {
-        let flock = FlockFake(vec![entry(
-            0,
-            "metrics",
-            Some(std::process::id() + 1),
-            true,
-        )]);
-        assert_eq!(adopted_name(&flock).await, None);
+    #[test]
+    fn an_empty_shep_dog_name_is_no_name() {
+        let identity = Identity::from_env(only("SHEP_DOG_NAME", ""));
+        assert_eq!(identity.handshake, None);
+        assert_eq!(identity.section, DEFAULT_NAME);
     }
 
-    #[tokio::test]
-    async fn a_shepherd_that_will_not_answer_yields_no_name() {
-        assert_eq!(adopted_name(&Unreachable).await, None);
+    #[test]
+    fn nothing_else_in_the_environment_names_this_dog() {
+        // $SHEP_NAME and $SHEP_INSTANCE are set alongside $SHEP_DOG_NAME and
+        // name the shepherd, not the dog. Reading either would put the
+        // shepherd's own name in the handshake.
+        let identity = Identity::from_env(only("SHEP_NAME", "production"));
+        assert_eq!(identity.handshake, None);
+        assert_eq!(identity.section, DEFAULT_NAME);
     }
 
     #[test]

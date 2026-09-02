@@ -139,15 +139,19 @@ impl Shepherd {
     /// Start this dog as a plain child process, the way an operator running
     /// it by hand would, with its output captured for the test to read.
     ///
-    /// Adoption is a separate question with its own tests. A dog started
-    /// this way is not in the flock, so it announces that it cannot identify
-    /// itself and falls back to `log-rotate`, which is the section these
-    /// tests write.
+    /// Adoption is a separate question with its own tests. Nothing spawned
+    /// this dog, so it gets no `$SHEP_DOG_NAME`: it announces that, connects
+    /// without naming itself, and reads `[dog.log-rotate]`, which is the
+    /// section these tests write. The variable is removed rather than merely
+    /// left unset, because this child inherits the environment of whoever
+    /// ran `cargo test`, and a developer running the suite from inside an
+    /// adopted shell would otherwise hand the dog somebody else's name.
     fn spawn_dog(&self) -> DogProcess {
         let out = fs::File::create(self.home().join("dog.out")).expect("dog.out");
         let err = fs::File::create(self.home().join("dog.err")).expect("dog.err");
         let child = Command::new(DOG_BIN)
             .env("SHEP_HOME", self.home())
+            .env_remove("SHEP_DOG_NAME")
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -354,14 +358,13 @@ fn no_line_is_lost(naming: &str) {
     dog.stop();
     shepherd.ok(&["stop", "counter", "--style", "bare"]);
 
-    // A dog nobody adopted is not in the flock, so it cannot find its own
-    // name, and the one thing it must never do about that is fall back
-    // quietly: an operator who mistyped the name in `shep adopt` would get
-    // this same silence with every setting discarded.
+    // A dog nobody adopted gets no `$SHEP_DOG_NAME`, so it has no name to
+    // announce and no section but the default, and the one thing it must
+    // never do about that is fall back quietly: an operator who mistyped the
+    // name in `shep adopt` would get this same silence with every setting
+    // discarded.
     assert!(
-        shepherd
-            .dog_stderr()
-            .contains("cannot tell what it was adopted as"),
+        shepherd.dog_stderr().contains("$SHEP_DOG_NAME is not set"),
         "{naming}: an unadopted dog must say so: {:?}",
         shepherd.dog_stderr()
     );
@@ -413,10 +416,11 @@ fn no_log_line_is_lost_across_a_numeric_rotation() {
 #[test]
 fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     // Adopted as something that is NOT the default name, because the default
-    // name is exactly what a broken lookup falls back to. The section gives
-    // it a `max_size` far below the 10M default, so a single rotated
-    // generation is proof the section was found: the sheep below writes a
-    // few hundred kilobytes, which the default would never rotate.
+    // name is exactly what a dog that never read `$SHEP_DOG_NAME` falls back
+    // to. The section gives it a `max_size` far below the 10M default, so a
+    // single rotated generation is proof the section was found: the sheep
+    // below writes a few hundred kilobytes, which the default would never
+    // rotate.
     let shepherd = Shepherd::new();
     let sentinel = shepherd.home().join("finished");
     let script = counter_script(shepherd.home(), 40_000, &sentinel);
@@ -445,14 +449,16 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     });
 
     // The dog is in the flock under its adopted name, and identified itself.
+    // Only shep can put `weathervane` in this dog's environment, so a silent
+    // stderr here is the whole of the proof that it read the variable.
     let listing = shepherd.ok(&["dogs", "--format", "json"]);
     assert!(listing.contains("weathervane"), "{listing}");
     let complaint = fs::read_to_string(shepherd.logs().join("weathervane-0-err.log"))
         .expect("the dog's own stderr log");
     assert!(
-        !complaint.contains("cannot tell what it was adopted as"),
-        "the dog failed to identify itself and fell back to the default name, so every \
-         setting in [dog.weathervane] was silently discarded: {complaint}"
+        !complaint.contains("$SHEP_DOG_NAME is not set"),
+        "the dog never saw $SHEP_DOG_NAME, so it announced no name and fell back to the \
+         default section, discarding every setting in [dog.weathervane]: {complaint}"
     );
 
     // And it rotated at 8K rather than at the 10M default.
