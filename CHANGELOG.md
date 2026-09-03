@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-03
+
+### Fixed
+
+- Name this dog in the handshake so shep records one
+- Name the section this dog was actually adopted as
+- Let one config fault name one section, and the right one
+- Keep the shepherd's socket path out of Debug, and say why Error keeps its own
+
+
 ## [0.1.4] - 2026-08-31
 
 ### Fixed
