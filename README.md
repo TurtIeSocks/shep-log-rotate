@@ -24,6 +24,18 @@ cargo install shep-log-rotate
 shep adopt shep-log-rotate
 ```
 
+Upgrading later wants `--force`:
+
+```sh
+cargo install shep-log-rotate --force
+shep restart log-rotate
+```
+
+That flag is not politeness. This dog links `shep-client`, and its own version
+does not change when that does, so after you upgrade shep the rebuild you need
+is exactly the one cargo declines to do: it prints `already installed, use
+--force to override`, builds nothing, and exits 0. It looks like it worked.
+
 `shep adopt` records the binary in `shep.toml` and starts it. From then on
 the shepherd supervises it like anything else in the flock, and `shep dogs`
 lists it.
