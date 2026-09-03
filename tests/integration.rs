@@ -298,12 +298,35 @@ fn generations_oldest_first(dir: &Path, base: &str, numeric: bool) -> Vec<PathBu
     ordered
 }
 
+/// A whole log file with shep's per-line timestamp taken back off.
+///
+/// For the cases that compare file CONTENT rather than counting lines. Same
+/// `shep_core::logstamp::strip` every reader in `shep-cli` uses, so what is
+/// asserted against is what an operator is shown.
+fn unstamped(path: &Path, what: &str) -> String {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{what}: {e}"));
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(shep_client::shep_core::logstamp::strip(line));
+        out.push('\n');
+    }
+    out
+}
+
 /// Concatenate `files` in order and read the whole thing back as numbers.
 ///
 /// Bytes rather than lines, and concatenated before splitting: a line can be
 /// split across a rotation boundary if shep's write lands either side of the
 /// rename, and reading the files separately would turn one whole line into
 /// two broken ones and report a loss that did not happen.
+///
+/// Each line goes through `shep_core::logstamp::strip` first, the same call
+/// `shep bleats` makes. shep stamps every line it writes to a log FILE as of
+/// 0.1.28, so the counter this test wrote comes back as
+/// `2026-09-03T16:19:38.123-04:00 41` and parses as nothing at all without
+/// this. Stripping is by recognition rather than by cutting a fixed prefix,
+/// so a line that never carried a stamp comes back unchanged and the halves
+/// of a torn line still rejoin correctly.
 fn concatenated_counter(files: &[PathBuf]) -> Vec<u64> {
     let mut bytes = Vec::new();
     for path in files {
@@ -312,6 +335,7 @@ fn concatenated_counter(files: &[PathBuf]) -> Vec<u64> {
     String::from_utf8(bytes)
         .expect("the counter is ascii")
         .lines()
+        .map(shep_client::shep_core::logstamp::strip)
         .filter(|line| !line.is_empty())
         .map(|line| line.parse::<u64>().expect("a counter line"))
         .collect()
@@ -605,7 +629,11 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
     shepherd.ok(&["stop", "beta", "--style", "bare"]);
 
     // `beta`'s live log still holds `beta`'s lines and nobody else's.
-    let betas = fs::read_to_string(real.join("app.log.1")).expect("beta's live log");
+    // Unstamped before comparing, for the reason `concatenated_counter`
+    // gives. The negative assertion is the one that needed it most: against
+    // stamped text `contains("\n0\n")` can no longer match alpha's line, so
+    // it would have passed whether or not alpha's output landed here.
+    let betas = unstamped(&real.join("app.log.1"), "beta's live log");
     assert!(
         betas.starts_with("B0\n"),
         "beta's live log was renamed out from under it: {:?}",
@@ -617,7 +645,7 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
     );
 
     // And `alpha` was left alone whole: skipped, not half rotated.
-    let alphas = fs::read_to_string(real.join("app.log")).expect("alpha's live log");
+    let alphas = unstamped(&real.join("app.log"), "alpha's live log");
     assert!(alphas.starts_with("0\n"), "alpha's log lost its start");
     assert!(
         !real.join("app.log.1.1").exists(),
