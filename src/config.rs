@@ -58,6 +58,11 @@ impl Default for Config {
 #[derive(Debug)]
 pub enum ConfigError {
     /// The text was not valid TOML, or carried a key this dog does not know.
+    ///
+    /// Names no section. [`Error::Config`](crate::error::Error::Config) wraps
+    /// this and supplies the `[dog.<name>]` the text came from, so spelling one
+    /// here would print two sections for one fault and get one of them wrong
+    /// for any dog not adopted under the default name.
     Toml(String),
     /// A `max_size` or similar was not spelled the way shep spells it.
     Size {
@@ -87,7 +92,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Toml(message) => write!(f, "invalid [dog.log-rotate] section: {message}"),
+            Self::Toml(message) => write!(f, "invalid TOML: {message}"),
             Self::Size {
                 field,
                 value,

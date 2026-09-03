@@ -128,6 +128,24 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_toml_fault_names_one_section_and_it_is_the_adopted_one() {
+        let err = Error::Config {
+            section: "weathervane".to_owned(),
+            source: ConfigError::Toml("expected `=` after a key".to_owned()),
+        };
+        let shown = err.to_string();
+        assert_eq!(
+            shown,
+            "bad [dog.weathervane] section: invalid TOML: expected `=` after a key"
+        );
+        assert_eq!(
+            shown.matches("[dog.").count(),
+            1,
+            "one fault names one section: {shown}"
+        );
+    }
+
+    #[test]
     fn every_variant_renders_without_an_em_dash() {
         let err = Error::Protocol("the shepherd answered Pong to a DogConfig".into());
         let shown = err.to_string();
