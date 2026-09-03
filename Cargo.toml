@@ -25,7 +25,14 @@ integration = []
 #
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
-shep-client = "0.1.0"
+#
+# The floor is 0.1.23 because that is the first release carrying
+# `ReconnectingClient::connect_as_dog`, and below it there is no public way
+# to put a name in the Hello frame. shep marks a dog as having handshaken
+# only when the frame names one, so a dog built against an older client
+# serves every request correctly and is still rendered `silent`, restarted
+# once, and then declared stale. See the module docs in src/main.rs.
+shep-client = "0.1.23"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -34,6 +41,11 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-support` only, and only so `Live`'s redacted `Debug` can be proven
+# against a real `ReconnectingClient` rather than asserted in a comment. The
+# feature gates shep-client's own `testing` module, which binds a fake
+# shepherd this crate can connect to. Nothing in the shipped binary sees it.
+shep-client = { version = "0.1.23", features = ["test-support"] }
 
 [[test]]
 name = "integration"

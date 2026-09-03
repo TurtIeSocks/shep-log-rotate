@@ -139,15 +139,19 @@ impl Shepherd {
     /// Start this dog as a plain child process, the way an operator running
     /// it by hand would, with its output captured for the test to read.
     ///
-    /// Adoption is a separate question with its own tests. A dog started
-    /// this way is not in the flock, so it announces that it cannot identify
-    /// itself and falls back to `log-rotate`, which is the section these
-    /// tests write.
+    /// Adoption is a separate question with its own tests. Nothing spawned
+    /// this dog, so it gets no `$SHEP_DOG_NAME`: it announces that, connects
+    /// without naming itself, and reads `[dog.log-rotate]`, which is the
+    /// section these tests write. The variable is removed rather than merely
+    /// left unset, because this child inherits the environment of whoever
+    /// ran `cargo test`, and a developer running the suite from inside an
+    /// adopted shell would otherwise hand the dog somebody else's name.
     fn spawn_dog(&self) -> DogProcess {
         let out = fs::File::create(self.home().join("dog.out")).expect("dog.out");
         let err = fs::File::create(self.home().join("dog.err")).expect("dog.err");
         let child = Command::new(DOG_BIN)
             .env("SHEP_HOME", self.home())
+            .env_remove("SHEP_DOG_NAME")
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -294,12 +298,35 @@ fn generations_oldest_first(dir: &Path, base: &str, numeric: bool) -> Vec<PathBu
     ordered
 }
 
+/// A whole log file with shep's per-line timestamp taken back off.
+///
+/// For the cases that compare file CONTENT rather than counting lines. Same
+/// `shep_core::logstamp::strip` every reader in `shep-cli` uses, so what is
+/// asserted against is what an operator is shown.
+fn unstamped(path: &Path, what: &str) -> String {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{what}: {e}"));
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(shep_client::shep_core::logstamp::strip(line));
+        out.push('\n');
+    }
+    out
+}
+
 /// Concatenate `files` in order and read the whole thing back as numbers.
 ///
 /// Bytes rather than lines, and concatenated before splitting: a line can be
 /// split across a rotation boundary if shep's write lands either side of the
 /// rename, and reading the files separately would turn one whole line into
 /// two broken ones and report a loss that did not happen.
+///
+/// Each line goes through `shep_core::logstamp::strip` first, the same call
+/// `shep bleats` makes. shep stamps every line it writes to a log FILE as of
+/// 0.1.28, so the counter this test wrote comes back as
+/// `2026-09-03T16:19:38.123-04:00 41` and parses as nothing at all without
+/// this. Stripping is by recognition rather than by cutting a fixed prefix,
+/// so a line that never carried a stamp comes back unchanged and the halves
+/// of a torn line still rejoin correctly.
 fn concatenated_counter(files: &[PathBuf]) -> Vec<u64> {
     let mut bytes = Vec::new();
     for path in files {
@@ -308,6 +335,7 @@ fn concatenated_counter(files: &[PathBuf]) -> Vec<u64> {
     String::from_utf8(bytes)
         .expect("the counter is ascii")
         .lines()
+        .map(shep_client::shep_core::logstamp::strip)
         .filter(|line| !line.is_empty())
         .map(|line| line.parse::<u64>().expect("a counter line"))
         .collect()
@@ -354,14 +382,13 @@ fn no_line_is_lost(naming: &str) {
     dog.stop();
     shepherd.ok(&["stop", "counter", "--style", "bare"]);
 
-    // A dog nobody adopted is not in the flock, so it cannot find its own
-    // name, and the one thing it must never do about that is fall back
-    // quietly: an operator who mistyped the name in `shep adopt` would get
-    // this same silence with every setting discarded.
+    // A dog nobody adopted gets no `$SHEP_DOG_NAME`, so it has no name to
+    // announce and no section but the default, and the one thing it must
+    // never do about that is fall back quietly: an operator who mistyped the
+    // name in `shep adopt` would get this same silence with every setting
+    // discarded.
     assert!(
-        shepherd
-            .dog_stderr()
-            .contains("cannot tell what it was adopted as"),
+        shepherd.dog_stderr().contains("$SHEP_DOG_NAME is not set"),
         "{naming}: an unadopted dog must say so: {:?}",
         shepherd.dog_stderr()
     );
@@ -413,10 +440,11 @@ fn no_log_line_is_lost_across_a_numeric_rotation() {
 #[test]
 fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     // Adopted as something that is NOT the default name, because the default
-    // name is exactly what a broken lookup falls back to. The section gives
-    // it a `max_size` far below the 10M default, so a single rotated
-    // generation is proof the section was found: the sheep below writes a
-    // few hundred kilobytes, which the default would never rotate.
+    // name is exactly what a dog that never read `$SHEP_DOG_NAME` falls back
+    // to. The section gives it a `max_size` far below the 10M default, so a
+    // single rotated generation is proof the section was found: the sheep
+    // below writes a few hundred kilobytes, which the default would never
+    // rotate.
     let shepherd = Shepherd::new();
     let sentinel = shepherd.home().join("finished");
     let script = counter_script(shepherd.home(), 40_000, &sentinel);
@@ -445,14 +473,16 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     });
 
     // The dog is in the flock under its adopted name, and identified itself.
+    // Only shep can put `weathervane` in this dog's environment, so a silent
+    // stderr here is the whole of the proof that it read the variable.
     let listing = shepherd.ok(&["dogs", "--format", "json"]);
     assert!(listing.contains("weathervane"), "{listing}");
     let complaint = fs::read_to_string(shepherd.logs().join("weathervane-0-err.log"))
         .expect("the dog's own stderr log");
     assert!(
-        !complaint.contains("cannot tell what it was adopted as"),
-        "the dog failed to identify itself and fell back to the default name, so every \
-         setting in [dog.weathervane] was silently discarded: {complaint}"
+        !complaint.contains("$SHEP_DOG_NAME is not set"),
+        "the dog never saw $SHEP_DOG_NAME, so it announced no name and fell back to the \
+         default section, discarding every setting in [dog.weathervane]: {complaint}"
     );
 
     // And it rotated at 8K rather than at the 10M default.
@@ -599,7 +629,11 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
     shepherd.ok(&["stop", "beta", "--style", "bare"]);
 
     // `beta`'s live log still holds `beta`'s lines and nobody else's.
-    let betas = fs::read_to_string(real.join("app.log.1")).expect("beta's live log");
+    // Unstamped before comparing, for the reason `concatenated_counter`
+    // gives. The negative assertion is the one that needed it most: against
+    // stamped text `contains("\n0\n")` can no longer match alpha's line, so
+    // it would have passed whether or not alpha's output landed here.
+    let betas = unstamped(&real.join("app.log.1"), "beta's live log");
     assert!(
         betas.starts_with("B0\n"),
         "beta's live log was renamed out from under it: {:?}",
@@ -611,7 +645,7 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
     );
 
     // And `alpha` was left alone whole: skipped, not half rotated.
-    let alphas = fs::read_to_string(real.join("app.log")).expect("alpha's live log");
+    let alphas = unstamped(&real.join("app.log"), "alpha's live log");
     assert!(alphas.starts_with("0\n"), "alpha's log lost its start");
     assert!(
         !real.join("app.log.1.1").exists(),

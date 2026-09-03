@@ -28,11 +28,11 @@ shep adopt shep-log-rotate
 the shepherd supervises it like anything else in the flock, and `shep dogs`
 lists it.
 
-The name it is adopted under is the name it looks itself up by, and it is also
-the config key. `--name` sets it, and defaults to the binary's file stem with a
-leading `shep-` stripped, so the command above lands on `log-rotate` and reads
-`[dog.log-rotate]`. Pass `--name rotator` and it reads `[dog.rotator]`. Any
-name works, as long as the section matches.
+The name it is adopted under is the name shep hands it in `$SHEP_DOG_NAME`, and
+it is also the config key. `--name` sets it, and defaults to the binary's file
+stem with a leading `shep-` stripped, so the command above lands on
+`log-rotate` and reads `[dog.log-rotate]`. Pass `--name rotator` and it reads
+`[dog.rotator]`. Any name works, as long as the section matches.
 
 Be careful with that second command, though. `shep adopt` checks that a binary
 is runnable by actually running it, for about fifty milliseconds, with your
@@ -207,27 +207,31 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` line 28 reads `shep-client = "0.1.0"`, by version alone, from
-crates.io. It carried a git URL alongside until shep published on 2026-08-26,
-which was the only thing blocking this crate from being published itself. Three
-stable versions of this crate have gone out since, plus one alpha.
+`Cargo.toml` reads `shep-client = "0.1.23"`, by version alone, from crates.io.
+It carried a git URL alongside until shep published on 2026-08-26, which was the
+only thing blocking this crate from being published itself.
 
-That requirement is a floor, not a pin. Cargo reads it as `^0.1.0` and would
-take any `0.1.x`. `Cargo.lock` holds it at `0.1.0` and `0.1.7` is the newest
-published, so what builds here today is the oldest client that satisfies the
-requirement.
+The floor is 0.1.23, the first release with `ReconnectingClient::connect_as_dog`.
+shep records a handshake only for a dog that names itself in the Hello frame, and
+one that does not is rendered `silent`, restarted once, then declared stale.
+Nothing below 0.1.23 has a public way to send that name.
+
+The floor and the lockfile answer different questions. `^0.1.23` is the oldest
+client this code compiles against. `Cargo.lock` holds 0.1.27, the newest
+published, and that is what a reproducible build of this crate ships: `cargo
+install` honours a packaged lockfile under `--locked`, so that file decides
+what an installer compiles rather than what merely could compile.
 
 Depending on the published surface rather than on a path is the point, not an
 accident. This project exists partly to find out whether somebody outside
 shep's own workspace can build a dog with what shep publishes, and a path
 dependency would quietly paper over anything missing from it.
 
-CI tests that pairing rather than assuming it. The `integration` job builds
-this crate against the locked `shep-client`, then installs the `shep` binary
-from the tip of shep's `main` and drives a real shepherd with it. So what is
-under test is the oldest supported client against shep's unreleased daemon,
-which is the widest the gap between the two can get, and a change in shep turns
-this repository red rather than reaching an operator first.
+CI tests that pairing rather than assuming it. The `integration` job installs
+`shep` from crates.io and drives a real shepherd with it, so a red job is a
+signal against shep's current published surface rather than against whatever
+`main` looks like on a given day. A change in a shep release turns this
+repository red rather than reaching an operator first.
 
 ## License
 
