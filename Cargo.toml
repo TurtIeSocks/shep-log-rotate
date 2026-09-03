@@ -41,6 +41,11 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-support` only, and only so `Live`'s redacted `Debug` can be proven
+# against a real `ReconnectingClient` rather than asserted in a comment. The
+# feature gates shep-client's own `testing` module, which binds a fake
+# shepherd this crate can connect to. Nothing in the shipped binary sees it.
+shep-client = { version = "0.1.23", features = ["test-support"] }
 
 [[test]]
 name = "integration"

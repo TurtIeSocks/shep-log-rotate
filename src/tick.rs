@@ -38,6 +38,7 @@
 //!
 //! [`prune::tidy`]: crate::prune::tidy
 
+use core::fmt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -478,11 +479,25 @@ fn is_generation_name_of(
 /// the dog is still running with a dead socket in its hand. The reconnect
 /// is the client's own business, so nothing above this type reconnects.
 ///
-/// `Debug` is derived: the only thing in here is the client, whose own
-/// `Debug` prints its socket path, the name it announced, its link state
-/// and the daemon's handshake ack, and nothing else.
-#[derive(Debug)]
+/// `Debug` is written rather than derived, and it prints nothing about the
+/// connection. [`ReconnectingClient`]'s own `Debug` carries its socket path,
+/// which is `$SHEP_HOME/run/shep.sock` and so usually sits under somebody's
+/// home directory. This is a `pub` type, so a consumer that logged one, or a
+/// `#[derive(Debug)]` on a struct that held one, would put that path
+/// somewhere an operator later pastes into a bug report. None of the four
+/// fields helps: the socket comes from the environment, the announced name is
+/// already in every message this dog writes, and the link state and handshake
+/// ack are both readable from the client itself when they are wanted.
+///
+/// Pinned by `debug_says_nothing_about_the_connection`, because a later
+/// `#[derive(Debug)]` here would be a silent regression.
 pub struct Live(ReconnectingClient);
+
+impl fmt::Debug for Live {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Live(<shepherd session>)")
+    }
+}
 
 impl Live {
     /// Wrap a connected client.
@@ -560,6 +575,35 @@ fn named(response: &Response) -> String {
 mod tests {
     use super::*;
     use shep_client::shep_core::protocol::ProcessInfo;
+
+    /// `Live`'s `Debug` is written rather than derived so a socket path under
+    /// somebody's home directory cannot reach a log or a bug report. Proven
+    /// against a real `ReconnectingClient` over a real socket, because the
+    /// thing being guarded against is the DERIVED impl, and a fake that did
+    /// not hold a client could not tell the two apart.
+    #[tokio::test]
+    async fn debug_says_nothing_about_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = shep_client::testing::control_address(dir.path());
+        let (_fake, _served) = shep_client::testing::fake_daemon_accepting_repeatedly(
+            &socket,
+            Response::Flock(Vec::new()),
+        );
+        let client = ReconnectingClient::connect_as_dog(&socket, "weathervane")
+            .await
+            .unwrap();
+        let shown = format!("{:?}", Live::new(client));
+
+        assert_eq!(shown, "Live(<shepherd session>)");
+        assert!(
+            !shown.contains("weathervane"),
+            "the announced name leaked: {shown}"
+        );
+        assert!(
+            !shown.contains(&socket.display().to_string()),
+            "the socket path leaked: {shown}"
+        );
+    }
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
     use std::fs;
