@@ -20,8 +20,17 @@ pub enum Error {
     Request(RequestError),
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
-    /// The `[dog.log-rotate]` section could not be understood.
-    Config(ConfigError),
+    /// The dog's own `[dog.<name>]` section could not be understood.
+    ///
+    /// Carries the section name rather than spelling a default one, because
+    /// the name is whatever `$SHEP_DOG_NAME` said and naming the wrong
+    /// section sends the reader to a block they never wrote.
+    Config {
+        /// The `[dog.<name>]` key the section was read from.
+        section: String,
+        /// What could not be understood in it.
+        source: ConfigError,
+    },
     /// A filesystem operation failed, naming the path it failed on.
     Io {
         /// The path being read, renamed, compressed or deleted.
@@ -50,7 +59,9 @@ impl fmt::Display for Error {
             Self::Connect(err) => write!(f, "cannot reach the shepherd: {err}"),
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
-            Self::Config(err) => write!(f, "bad [dog.log-rotate] section: {err}"),
+            Self::Config { section, source } => {
+                write!(f, "bad [dog.{section}] section: {source}")
+            }
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Exhausted { path } => {
                 write!(
@@ -68,7 +79,7 @@ impl core::error::Error for Error {
         match self {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
-            Self::Config(err) => Some(err),
+            Self::Config { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Protocol(_) | Self::Exhausted { .. } => None,
         }
@@ -87,12 +98,6 @@ impl From<RequestError> for Error {
     }
 }
 
-impl From<ConfigError> for Error {
-    fn from(err: ConfigError) -> Self {
-        Self::Config(err)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +111,20 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("/var/log/web-0-out.log"), "{shown}");
         assert!(shown.contains("denied"), "{shown}");
+    }
+
+    #[test]
+    fn a_bad_section_names_the_section_this_dog_was_adopted_as() {
+        let err = Error::Config {
+            section: "weathervane".to_owned(),
+            source: ConfigError::Keep,
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("[dog.weathervane]"), "{shown}");
+        assert!(
+            !shown.contains("log-rotate"),
+            "the default name leaked into a dog adopted as something else: {shown}"
+        );
     }
 
     #[test]

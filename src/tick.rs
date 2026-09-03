@@ -217,7 +217,15 @@ pub async fn tick<D: Daemon>(
     dog_name: &str,
     now: SystemTime,
 ) -> Result<(Config, Report), Error> {
-    let config = Config::from_toml(&daemon.dog_config(dog_name).await?)?;
+    // Named at the point of failure rather than through a `From` impl: the
+    // section is `[dog.<name>]` for whatever this dog was adopted as, and an
+    // error naming some other block sends the reader to a section they never
+    // wrote.
+    let config =
+        Config::from_toml(&daemon.dog_config(dog_name).await?).map_err(|source| Error::Config {
+            section: dog_name.to_owned(),
+            source,
+        })?;
     let flock = daemon.list_flock().await?;
     let protected = protected_paths(&flock);
     let mut report = Report::default();
