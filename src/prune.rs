@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// What one pass of [`tidy`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tidied {
     /// Files gzipped on this pass. A generation is compressed at most once,
     /// so this is also the number of generations compressed.
@@ -56,6 +56,11 @@ pub struct Tidied {
     /// them, and the only party that knows which files are being written to
     /// is the shepherd.
     pub skipped_protected: usize,
+    /// Compressions and deletions that failed, one message each. A fault is
+    /// one generation's: the generation is left as it was, and the pass goes
+    /// on to the next one and still prunes. A generation that will not
+    /// compress and is past `keep` is still deleted, plain.
+    pub faults: Vec<String>,
 }
 
 /// One rotated generation, and the file or files on disk carrying it.
@@ -94,6 +99,12 @@ impl Generation {
 /// together when it is pruned, and the next pass with compression on folds
 /// it back down to one file.
 ///
+/// A compression or a deletion that fails is one generation's fault,
+/// recorded in [`Tidied::faults`], and the pass goes on: the next generation
+/// is still compressed and the prune still runs. One generation that will
+/// not compress, a `.gz` target that is a directory say, must not hold every
+/// older generation of the base past `keep` for good.
+///
 /// No member of `protected` is ever compressed or deleted, whatever its name
 /// says, and none of them counts against `keep` either: a live log that
 /// happens to look like a generation is not one of this dog's, so sparing it
@@ -103,8 +114,8 @@ impl Generation {
 /// the guard off.
 ///
 /// # Errors
-/// [`Error::Io`], naming the path, if the log directory cannot be listed or
-/// if a generation cannot be read, compressed or removed.
+/// [`Error::Io`], naming the directory, if the log directory cannot be
+/// listed. Nothing can be done for a base whose generations cannot be seen.
 pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidied, Error> {
     let mut tidied = Tidied::default();
     let untouchable = protected.names_in(&protected.resolve(&base.dir));
@@ -163,7 +174,10 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
             // A `.gz` already sitting there is the half-written leftover of
             // the crash that made this generation a twin. Overwriting it is
             // how the interrupted compression finishes.
-            compress(&plain, &target)?;
+            if let Err(err) = compress(&plain, &target) {
+                tidied.faults.push(err.to_string());
+                continue;
+            }
             generation.plain = None;
             generation.gz = Some(target);
             tidied.compressed += 1;
@@ -175,8 +189,10 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
     // time, and one generation is one slot.
     for generation in ours.iter().skip(config.keep) {
         for path in generation.files() {
-            remove(path)?;
-            tidied.deleted += 1;
+            match remove(path) {
+                Ok(()) => tidied.deleted += 1,
+                Err(err) => tidied.faults.push(err.to_string()),
+            }
         }
     }
 
@@ -677,6 +693,56 @@ mod tests {
             mode, 0o600,
             "a log kept private must not widen when it is compressed"
         );
+    }
+
+    #[test]
+    fn a_generation_that_will_not_compress_does_not_stop_the_prune() {
+        // The .gz target of the middle generation is a directory, so its
+        // compression fails. The older generation still compresses, and with
+        // keep = 1 both are still pruned: the fault is the one generation's
+        // and the pass is not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for second in 1..=3 {
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
+                format!("gen{second}\n"),
+            );
+        }
+        let blocker = dir.path().join("web-0-out.2026-08-20T15-04-02.log.gz");
+        fs::create_dir(&blocker).expect("blocker");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
+
+        assert_eq!(tidied.faults.len(), 1, "{:?}", tidied.faults);
+        assert!(
+            tidied.faults[0].contains("15-04-02.log.gz"),
+            "{:?}",
+            tidied.faults
+        );
+        assert_eq!(
+            tidied.compressed, 1,
+            "the generation past the fault still compressed"
+        );
+        assert_eq!(tidied.deleted, 2, "and keep = 1 still pruned both");
+        assert!(
+            dir.path()
+                .join("web-0-out.2026-08-20T15-04-03.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-02.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-01.log.gz")
+                .exists()
+        );
+        assert!(blocker.is_dir(), "the blocker is not this dog's to remove");
     }
 
     #[test]
