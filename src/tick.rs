@@ -136,7 +136,9 @@ pub struct Report {
     /// so it carries that field's unit.
     pub skipped_protected: usize,
     /// The sheep whose reopen was refused, and what it said. Set means the
-    /// tick stopped early and rotated no further sheep.
+    /// tick stopped early: no further sheep was rotated, and nothing that
+    /// sheep or a later one writes to was compressed or pruned. What the
+    /// sheep before it had reopened was still tidied.
     pub reopen_failed: Option<String>,
 }
 
@@ -193,9 +195,12 @@ impl Report {
 /// 3. Stat and qualify every log path, before renaming any of them, so that
 ///    two sheep sharing one path both see it as it was.
 /// 4. Per sheep: rename its qualifying files, then reopen that sheep alone.
-/// 5. Only once every reopen is done, compress and prune. Compressing a
-///    large log is not quick, and doing it first would widen the stretch
-///    during which shep is still writing through its old descriptor.
+/// 5. Only once the reopens are done, compress and prune, and only the logs
+///    whose every sheep reopened. Compressing a large log is not quick, and
+///    doing it first would widen the stretch during which shep is still
+///    writing through its old descriptor. Compressing one whose sheep never
+///    reopened would read a file mid-append and then delete what shep is
+///    writing to.
 ///
 /// # Errors
 /// - [`Error::Config`] if the `[dog.<name>]` section cannot be understood.
@@ -207,8 +212,10 @@ impl Report {
 ///   still writing into the renamed file through its existing descriptor, so
 ///   nothing is lost and the next successful reopen recovers.
 /// - [`Error::Io`] or [`Error::Exhausted`] from a rename, a compression or a
-///   deletion. A failed rename still reopens the sheep it half rotated
-///   before it returns.
+///   deletion. A failed rename still reopens the sheep it half rotated, and
+///   still tidies what every sheep before it had reopened, before it
+///   returns. When both the rename and a tidy fail, the rename is the error
+///   reported: it is the first fault, and the tidy recurs next tick.
 pub async fn tick<D: Daemon>(
     daemon: &D,
     dog_name: &str,
@@ -274,11 +281,17 @@ pub async fn tick<D: Daemon>(
     // second rename of a file that has already moved fails with NotFound and
     // leaves the second sheep never reopened.
     let mut renamed = FileSet::default();
+    // Bases whose sheep has reopened, so shep has stopped writing into what
+    // was renamed. Only those are safe to compress or delete.
     let mut to_tidy: Vec<LogPath> = Vec::new();
     let mut halt: Option<Error> = None;
+    // Where in `order` the loop stopped early, if it did: the sheep at this
+    // position and every one after it was not reopened this tick.
+    let mut not_reopened_from: Option<usize> = None;
 
-    'flock: for name in &order {
+    'flock: for (position, name) in order.iter().enumerate() {
         let mut rotated_any = false;
+        let mut rotated_here: Vec<LogPath> = Vec::new();
         for base in &groups[name] {
             // Through `protected` rather than `ResolvedDir::of`, so this
             // base is resolved the way the protected set was, at the moment
@@ -299,7 +312,7 @@ pub async fn tick<D: Daemon>(
             match rotate(base, config.naming, now) {
                 Ok(_generation) => {
                     renamed.insert(dir, live_name);
-                    to_tidy.push(base.clone());
+                    rotated_here.push(base.clone());
                     report.rotated += 1;
                     rotated_any = true;
                 }
@@ -315,32 +328,67 @@ pub async fn tick<D: Daemon>(
             }
         }
 
-        if rotated_any && let Err(err) = daemon.reopen(name).await {
-            // Rotating further sheep while the reopen path is broken turns
-            // one recoverable state into several confusing ones.
-            report.reopen_failed = Some(format!("{name}: {err}"));
-            break 'flock;
+        if rotated_any {
+            if let Err(err) = daemon.reopen(name).await {
+                // Rotating further sheep while the reopen path is broken
+                // turns one recoverable state into several confusing ones.
+                report.reopen_failed = Some(format!("{name}: {err}"));
+                not_reopened_from = Some(position);
+                break 'flock;
+            }
+            to_tidy.extend(rotated_here);
         }
         if halt.is_some() {
+            // This sheep was reopened for whatever it did rotate. The ones
+            // after it were never reached.
+            not_reopened_from = Some(position + 1);
             break 'flock;
         }
     }
 
+    // A sheep the loop never reached, or whose reopen was refused, is still
+    // writing into a renamed file through its old descriptor. Two sheep can
+    // share one log path, so a base an earlier sheep reopened may be that
+    // same file: compressing it would read it mid-append, and removing the
+    // plain copy afterwards would delete what shep is writing to. Anything
+    // such a sheep writes to is left for a later tick.
+    if let Some(from) = not_reopened_from {
+        let mut still_writing = FileSet::default();
+        for name in &order[from..] {
+            for base in &groups[name] {
+                still_writing.insert(protected.resolve(&base.dir), base.live_name());
+            }
+        }
+        to_tidy.retain(|base| {
+            !still_writing.contains(&protected.resolve(&base.dir), &base.live_name())
+        });
+    }
+
+    let tidied = tidy_all(&to_tidy, &config, &protected, &mut report);
     if let Some(err) = halt {
         return Err(err);
     }
-    if report.reopen_failed.is_some() {
-        return Ok((config, report));
-    }
+    tidied?;
+    Ok((config, report))
+}
 
-    for base in &to_tidy {
-        let tidied = tidy(base, &config, &protected)?;
+/// Compress and prune each of `bases`, adding what happened to `report`.
+///
+/// Counts already added stay added when a later base fails: they describe
+/// work that was done.
+fn tidy_all(
+    bases: &[LogPath],
+    config: &Config,
+    protected: &FileSet,
+    report: &mut Report,
+) -> Result<(), Error> {
+    for base in bases {
+        let tidied = tidy(base, config, protected)?;
         report.compressed += tidied.compressed;
         report.deleted += tidied.deleted;
         report.skipped_protected += tidied.skipped_protected;
     }
-
-    Ok((config, report))
+    Ok(())
 }
 
 /// Whether a log has grown or aged past what `config` allows.
@@ -971,6 +1019,123 @@ mod tests {
         assert!(
             reopened.contains(&"web-1".to_owned()),
             "the second sheep still holds the old descriptor and needs its reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_reopen_still_tidies_the_sheep_that_did_reopen() {
+        // api rotates and reopens, then web's reopen is refused. api's
+        // generations are safe to tidy: shep has stopped writing into the
+        // one that was renamed. Leaving them for api's next rotation is
+        // what used to happen, and a sheep that grows slowly waited weeks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api = dir.path().join("api-0-out.log");
+        let web = dir.path().join("web-0-out.log");
+        fs::write(&api, "x".repeat(2048)).expect("seeded");
+        fs::write(&web, "x".repeat(2048)).expect("seeded");
+        for second in [1, 2] {
+            fs::write(
+                dir.path()
+                    .join(format!("api-0-out.2026-08-20T15-04-0{second}.log")),
+                "old\n",
+            )
+            .expect("seeded");
+        }
+        let webs_old = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        fs::write(&webs_old, "old\n").expect("seeded");
+        let fake = Fake {
+            reopen_fails: Some("web".into()),
+            ..Fake::new(
+                "max_size = \"1K\"\nkeep = 1\ncompress = false\n",
+                vec![
+                    sheep("api", Some(&api), None),
+                    sheep("web", Some(&web), None),
+                ],
+            )
+        };
+
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+            .await
+            .expect("a refused reopen is reported, not returned as an error");
+
+        assert!(report.reopen_failed.is_some());
+        assert_eq!(report.rotated, 2, "both rotated before the refusal");
+        assert_eq!(
+            report.deleted, 2,
+            "api's two old generations went, and only those"
+        );
+        assert!(
+            webs_old.exists(),
+            "web never reopened, so nothing of web's may be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_reopen_leaves_a_shared_path_alone() {
+        // web-0 and web-1 write to one file. web-0 reopens, web-1 is
+        // refused. web-1 is still writing into the renamed generation
+        // through its old descriptor, so that file is not safe to compress
+        // or delete however many sheep did reopen it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("web-out.log");
+        fs::write(&shared, "x".repeat(2048)).expect("seeded");
+        let old = dir.path().join("web-out.2026-08-20T15-04-01.log");
+        fs::write(&old, "old\n").expect("seeded");
+        let fake = Fake {
+            reopen_fails: Some("web-1".into()),
+            ..Fake::new(
+                "max_size = \"1K\"\nkeep = 1\ncompress = false\n",
+                vec![
+                    sheep("web-0", Some(&shared), None),
+                    sheep("web-1", Some(&shared), None),
+                ],
+            )
+        };
+
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+            .await
+            .expect("ticked");
+
+        assert_eq!(report.rotated, 1);
+        assert!(report.reopen_failed.is_some());
+        assert_eq!(
+            report.deleted, 0,
+            "the shared path was left for a later tick"
+        );
+        assert!(old.exists());
+    }
+
+    #[tokio::test]
+    async fn a_rename_that_fails_still_tidies_what_did_reopen() {
+        // api's out log rotates, its err log cannot (no generation numbers
+        // left), api is reopened for the half that moved. The out log's
+        // generations are then safe to tidy, and the rename fault is still
+        // the error the tick returns.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("api-0-out.log");
+        let err = dir.path().join("api-0-err.log");
+        fs::write(&out, "x".repeat(2048)).expect("seeded");
+        fs::write(&err, "x".repeat(2048)).expect("seeded");
+        fs::write(dir.path().join("api-0-out.log.1"), "old\n").expect("seeded");
+        fs::write(dir.path().join("api-0-err.log.4294967295"), "oldest").expect("seeded");
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\nkeep = 1\ncompress = false\n",
+            vec![sheep("api", Some(&out), Some(&err))],
+        );
+
+        let failure = tick(&fake, "log-rotate", SystemTime::now())
+            .await
+            .expect_err("no generation numbers left");
+
+        assert!(matches!(failure, Error::Exhausted { .. }), "{failure:?}");
+        assert_eq!(*fake.reopened.borrow(), vec!["api".to_owned()]);
+        assert!(
+            dir.path().join("api-0-out.log.1").exists(),
+            "the live file moved to .1"
+        );
+        assert!(
+            !dir.path().join("api-0-out.log.2").exists(),
+            "the old generation, shifted to .2, was past keep = 1 and went"
         );
     }
 }
