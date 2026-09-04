@@ -6,11 +6,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::naming::LogPath;
+
 /// Write `body` to `name` inside `dir`, and hand back the path.
 pub fn seed(dir: &Path, name: impl AsRef<Path>, body: impl AsRef<[u8]>) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, body).expect("seeded");
     path
+}
+
+/// Seed a live log called `name` in `dir` and hand back its [`LogPath`].
+pub fn live_log(dir: &Path, name: &str, body: impl AsRef<[u8]>) -> LogPath {
+    LogPath::split(&seed(dir, name, body)).expect("a seeded log splits")
 }
 
 /// Assert `text` carries neither an em dash nor an en dash.

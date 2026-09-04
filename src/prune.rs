@@ -254,7 +254,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, Naming},
-        test_support::seed,
+        test_support::{live_log, seed},
     };
     use std::fs;
 
@@ -277,8 +277,7 @@ mod tests {
                 "body\n",
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
@@ -314,8 +313,7 @@ mod tests {
         let body = "line one\nline two\nline three\n";
         seed(dir.path(), "web-0-out.2026-08-20T15-04-05.log", body);
         seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
@@ -340,8 +338,7 @@ mod tests {
                 format!("gen{second}\n"),
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 2, false), &FileSet::default()).expect("tidied");
@@ -390,8 +387,7 @@ mod tests {
         for decoy in decoys {
             seed(dir.path(), decoy, "not ours\n");
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
@@ -413,8 +409,7 @@ mod tests {
                 format!("gen{n}\n"),
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(
             &base,
@@ -437,8 +432,7 @@ mod tests {
         for n in 1..=9 {
             seed(dir.path(), format!("web-0-out.log.{n}"), "old scheme\n");
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
@@ -459,8 +453,7 @@ mod tests {
             "already\n",
         );
         seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
@@ -483,8 +476,7 @@ mod tests {
                 "body\n",
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, false), &FileSet::default()).expect("tidied");
@@ -513,8 +505,7 @@ mod tests {
         for n in 1..=5 {
             seed(dir.path(), format!("web.{n}"), format!("gen{n}\n"));
         }
-        seed(dir.path(), "web", "live\n");
-        let base = LogPath::split(&dir.path().join("web")).expect("splits");
+        let base = live_log(dir.path(), "web", "live\n");
         let live_elsewhere = dir.path().join("web.2");
         let protected = FileSet::from_paths([live_elsewhere.as_path()]);
 
@@ -551,8 +542,7 @@ mod tests {
                 format!("gen{second}\n"),
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let oldest = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
         let protected = FileSet::from_paths([oldest.as_path()]);
 
@@ -574,8 +564,7 @@ mod tests {
         let live_elsewhere = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
         fs::write(&live_elsewhere, "somebody is writing here\n").expect("seeded");
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let protected = FileSet::from_paths([live_elsewhere.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 5, true), &protected).expect("tidied");
@@ -616,8 +605,7 @@ mod tests {
                 "ours\n",
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
@@ -650,8 +638,7 @@ mod tests {
                 "ours\n",
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
@@ -677,8 +664,7 @@ mod tests {
         fs::write(&private, "a token, probably\n").expect("seeded");
         fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("chmod");
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
@@ -703,8 +689,7 @@ mod tests {
                 "ours\n",
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied = tidy(
             &base,
@@ -726,8 +711,7 @@ mod tests {
     #[test]
     fn a_base_with_nothing_to_tidy_is_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
@@ -767,8 +751,7 @@ mod tests {
         // and be spared as "the newest stays plain" whichever order the
         // directory happens to list them in.
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
@@ -805,8 +788,7 @@ mod tests {
             "half a gzip stream",
         );
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 2, true), &FileSet::default()).expect("tidied");
@@ -847,8 +829,7 @@ mod tests {
             "half a gzip stream",
         );
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default())
             .expect("the pass must not abort");
@@ -884,8 +865,7 @@ mod tests {
         fs::write(&plain, "doomed\n").expect("seeded");
         fs::write(&gz, "also doomed\n").expect("seeded");
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 1, false), &FileSet::default()).expect("tidied");
@@ -915,8 +895,7 @@ mod tests {
                 format!("gen{second}\n"),
             );
         }
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let spelled_the_long_way = dir
             .path()
             .join("sub")
@@ -953,8 +932,7 @@ mod tests {
                 format!("gen{second}\n"),
             );
         }
-        seed(&real, "web-0-out.log", "live\n");
-        let base = LogPath::split(&real.join("web-0-out.log")).expect("splits");
+        let base = live_log(&real, "web-0-out.log", "live\n");
         let protected =
             FileSet::from_paths([through.join("web-0-out.2026-08-20T15-04-01.log").as_path()]);
 
@@ -982,8 +960,7 @@ mod tests {
         fs::write(&stale, "half a gzip stream").expect("seeded");
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).expect("chmod");
         seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        seed(dir.path(), "web-0-out.log", "live\n");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
