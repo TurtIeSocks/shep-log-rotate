@@ -16,8 +16,17 @@
 //! compared, and it goes through once. `canonicalize` is a syscall, and the
 //! guards used to resolve every member against every base, a count that
 //! grew with the square of the flock. Building the set resolves each
-//! distinct directory once, and a lookup resolves the directory it is asked
-//! about once.
+//! distinct directory once and remembers the answer, so a lookup about a
+//! directory the set was built from costs nothing.
+//!
+//! Remembering is also what keeps the two sides in step. The set is built
+//! when the tick starts, and the lookups run after the renames and the
+//! reopens, and a link can move in between: a deploy flipping `logs` from
+//! one release to the next is the ordinary case. A key resolved at build
+//! time and a lookup resolved later would miss each other, and the guard
+//! would go quiet on a file that is still live. [`FileSet::resolve`] answers
+//! for a remembered spelling the way it did when the set was built, so
+//! every guard compares against the same picture of the disk.
 //!
 //! What resolving does not cover: a hard link, and case on a
 //! case-insensitive filesystem, where `/var/log/WEB.1` and `/var/log/web.1`
@@ -52,8 +61,11 @@ use crate::naming::LogPath;
 pub struct ResolvedDir(PathBuf);
 
 impl ResolvedDir {
-    /// Resolve `dir`. One syscall, so callers resolve once per base and
-    /// reuse the answer.
+    /// Resolve `dir` as the disk spells it right now. One syscall.
+    ///
+    /// A guard asking about a directory the flock reported goes through
+    /// [`FileSet::resolve`] instead, which remembers this answer from when
+    /// the set was built and so agrees with the keys it is looking up.
     pub fn of(dir: &Path) -> Self {
         Self(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()))
     }
@@ -68,6 +80,9 @@ impl ResolvedDir {
 pub struct FileSet {
     /// File names per directory.
     by_dir: BTreeMap<ResolvedDir, BTreeSet<String>>,
+    /// Every directory spelling this set was built from, and what it
+    /// resolved to at the time.
+    resolved: BTreeMap<PathBuf, ResolvedDir>,
 }
 
 impl FileSet {
@@ -91,12 +106,27 @@ impl FileSet {
         }
         let mut set = Self::default();
         for (dir, names) in by_written_dir {
+            let resolved = ResolvedDir::of(&dir);
             set.by_dir
-                .entry(ResolvedDir::of(&dir))
+                .entry(resolved.clone())
                 .or_default()
                 .extend(names);
+            set.resolved.insert(dir, resolved);
         }
         set
+    }
+
+    /// Resolve `dir` the way this set did when it was built, or as the disk
+    /// spells it now for a spelling the set was not built from.
+    ///
+    /// Every base a tick acts on came out of the same flock listing the set
+    /// was built from, so the first arm is the one that runs, and it costs
+    /// a map lookup rather than a syscall.
+    pub fn resolve(&self, dir: &Path) -> ResolvedDir {
+        self.resolved
+            .get(dir)
+            .cloned()
+            .unwrap_or_else(|| ResolvedDir::of(dir))
     }
 
     /// Add one file.
@@ -211,5 +241,45 @@ mod tests {
         set.insert(here.clone(), "web.log".to_owned());
         assert!(set.contains(&here, "web.log"));
         assert_eq!(set.names_in(&here).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_set_was_built_from_resolves_as_it_did_then() {
+        // The lookups run after the renames and the reopens, and a link can
+        // move in between: a deploy flipping `logs` from one release to the
+        // next is the ordinary case, not a trick. A key resolved when the
+        // set was built and a lookup resolved later would miss each other,
+        // and the guard would go quiet on a file that is still live.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let before = tmp.path().join("release-1");
+        let after = tmp.path().join("release-2");
+        fs::create_dir(&before).expect("created");
+        fs::create_dir(&after).expect("created");
+        let link = tmp.path().join("logs");
+        std::os::unix::fs::symlink(&before, &link).expect("linked");
+        let set = FileSet::from_paths([link.join("web.1").as_path()]);
+
+        fs::remove_file(&link).expect("unlinked");
+        std::os::unix::fs::symlink(&after, &link).expect("relinked");
+
+        assert_eq!(
+            set.resolve(&link),
+            dir(&before),
+            "as it was when the set was built"
+        );
+        assert_ne!(
+            ResolvedDir::of(&link),
+            dir(&before),
+            "which is no longer what the disk says"
+        );
+        assert!(set.contains(&set.resolve(&link), "web.1"));
+    }
+
+    #[test]
+    fn a_directory_the_set_was_not_built_from_resolves_now() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let set = FileSet::from_paths([Path::new("/nonexistent/log/web.1")]);
+        assert_eq!(set.resolve(tmp.path()), dir(tmp.path()));
     }
 }

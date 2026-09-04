@@ -280,7 +280,10 @@ pub async fn tick<D: Daemon>(
     'flock: for name in &order {
         let mut rotated_any = false;
         for base in &groups[name] {
-            let dir = ResolvedDir::of(&base.dir);
+            // Through `protected` rather than `ResolvedDir::of`, so this
+            // base is resolved the way the protected set was, at the moment
+            // the set was built. See the `file_set` module docs.
+            let dir = protected.resolve(&base.dir);
             let live_name = base.live_name();
             if renamed.contains(&dir, &live_name) {
                 // Another sheep shares this path and has already rotated it.
@@ -373,7 +376,7 @@ fn log_paths(sheep: &ProcessInfo) -> impl Iterator<Item = &str> {
 }
 
 /// Whether rotating `base` could disturb a path some sheep is using as a
-/// live log. `dir` is `base.dir`, resolved.
+/// live log. `dir` is `base.dir`, resolved through `protected`.
 ///
 /// A `true` here skips the base whole: not rotated, and so not tidied
 /// either.

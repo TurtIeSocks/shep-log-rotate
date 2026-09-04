@@ -23,7 +23,7 @@ use flate2::{Compression, write::GzEncoder};
 use crate::{
     config::Config,
     error::Error,
-    file_set::{FileSet, ResolvedDir},
+    file_set::FileSet,
     naming::{LogPath, Order, with_gz},
     rotate::{GenerationFile, generations},
 };
@@ -107,7 +107,7 @@ impl Generation {
 /// if a generation cannot be read, compressed or removed.
 pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidied, Error> {
     let mut tidied = Tidied::default();
-    let untouchable = protected.names_in(&ResolvedDir::of(&base.dir));
+    let untouchable = protected.names_in(&protected.resolve(&base.dir));
 
     // Two things happen here, and both are about slots.
     //
