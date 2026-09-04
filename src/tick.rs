@@ -38,8 +38,14 @@
 //!
 //! [`prune::tidy`]: crate::prune::tidy
 
-use core::fmt;
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::SystemTime};
+use core::{fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use shep_client::{
     LinkState, ReconnectingClient,
@@ -52,7 +58,7 @@ use crate::{
     file_set::{FileSet, ResolvedDir},
     naming::{LogPath, match_generation},
     prune::tidy,
-    rotate::rotate,
+    rotate::{last_rotation, regular_files, rotate},
     stop::Stop,
 };
 
@@ -253,6 +259,9 @@ pub async fn tick<D: Daemon>(
     // multi-instance app), and both have to see it as it was.
     let mut order: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, Vec<LogPath>> = BTreeMap::new();
+    // Each log directory's listing, read at most once per tick, for the
+    // logs whose age has to be read off their newest generation.
+    let mut listings: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     for sheep in &flock {
         for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
@@ -269,7 +278,7 @@ pub async fn tick<D: Daemon>(
                 report.skipped += 1;
                 continue;
             };
-            if !qualifies(&metadata, &config, now) {
+            if !qualifies(&base, &metadata, &config, now, &mut listings)? {
                 continue;
             }
             if !groups.contains_key(&sheep.name) {
@@ -446,21 +455,52 @@ async fn tidy_all(
 /// real one past `keep` and has it deleted: a rotator destroying the history
 /// it exists to keep. A sheep that logs nothing for a week is the ordinary
 /// way to reach this, not a contrived one.
-fn qualifies(metadata: &fs::Metadata, config: &Config, now: SystemTime) -> bool {
+///
+/// Age is counted from the last rotation, which the newest generation
+/// records (see [`last_rotation`]), or from when the file appeared if it has
+/// never been rotated and the filesystem keeps a birth time. The time since
+/// the last write is a lower bound on both, so a log nothing has written to
+/// for `max_age` qualifies without the directory being listed, and the
+/// listing is read once per directory per tick for the rest.
+///
+/// # Errors
+/// [`Error::Io`] if the log directory has to be listed and cannot be.
+fn qualifies(
+    base: &LogPath,
+    metadata: &fs::Metadata,
+    config: &Config,
+    now: SystemTime,
+    listings: &mut BTreeMap<PathBuf, Vec<String>>,
+) -> Result<bool, Error> {
     if metadata.len() == 0 {
-        return false;
+        return Ok(false);
     }
     if metadata.len() >= config.max_size.bytes() {
-        return true;
+        return Ok(true);
     }
     let Some(max_age) = config.max_age else {
-        return false;
+        return Ok(false);
     };
-    let Ok(modified) = metadata.modified() else {
-        return false;
+    let max_age = max_age.as_duration();
+    if aged(metadata.modified().ok(), now, max_age) {
+        return Ok(true);
+    }
+    let names = match listings.entry(base.dir.clone()) {
+        Entry::Vacant(slot) => slot.insert(regular_files(&base.dir)?),
+        Entry::Occupied(slot) => slot.into_mut(),
     };
-    now.duration_since(modified)
-        .is_ok_and(|age| age >= max_age.as_duration())
+    let since = last_rotation(names, base, config.naming).or_else(|| metadata.created().ok());
+    Ok(aged(since, now, max_age))
+}
+
+/// Whether `instant` is at least `max_age` before `now`.
+///
+/// `None` and an instant after `now` are both "not that old": a clock that
+/// went backwards is not a reason to rotate.
+fn aged(instant: Option<SystemTime>, now: SystemTime, max_age: Duration) -> bool {
+    instant
+        .and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|age| age >= max_age)
 }
 
 /// The log paths one sheep writes to: `out_file` and `err_file`, whichever
@@ -1247,5 +1287,74 @@ mod tests {
             took < core::time::Duration::from_millis(1500),
             "the tick waited for the gzip rather than the stop: {took:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn max_age_counts_from_the_last_rotation_not_the_last_write() {
+        // A log written every second never ages by its mtime. What max_age
+        // means is "this long since the last rotation", which for a dated
+        // base is in the newest generation's name.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "written just now\n").expect("seeded");
+        let eight_days_ago = SystemTime::now() - core::time::Duration::from_secs(8 * 86_400);
+        fs::write(
+            dir.path().join(format!(
+                "web-0-out.{}.log",
+                crate::naming::stamp_utc(eight_days_ago)
+            )),
+            "the last rotation\n",
+        )
+        .expect("seeded");
+        let fake = Fake::new(
+            "max_size = \"1G\"\nmax_age = \"168h\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 1, "eight days since the last rotation");
+    }
+
+    #[tokio::test]
+    async fn a_log_rotated_recently_is_not_rotated_again_for_age() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "written just now\n").expect("seeded");
+        let yesterday = SystemTime::now() - core::time::Duration::from_secs(86_400);
+        fs::write(
+            dir.path().join(format!(
+                "web-0-out.{}.log",
+                crate::naming::stamp_utc(yesterday)
+            )),
+            "the last rotation\n",
+        )
+        .expect("seeded");
+        let fake = Fake::new(
+            "max_size = \"1G\"\nmax_age = \"168h\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 0, "one day since the last rotation");
+        assert!(out.exists());
+    }
+
+    #[tokio::test]
+    async fn a_log_never_rotated_ages_from_when_it_appeared() {
+        // No generation to read a rotation from, and the file was created
+        // moments ago, so it has not aged whatever its mtime says.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "fresh\n").expect("seeded");
+        let fake = Fake::new(
+            "max_size = \"1G\"\nmax_age = \"1s\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 0);
     }
 }

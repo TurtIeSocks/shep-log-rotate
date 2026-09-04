@@ -193,6 +193,21 @@ pub fn stamp_utc(at: SystemTime) -> String {
     timestamp.strftime(STAMP_FORMAT).to_string()
 }
 
+/// Read a stamp [`stamp_utc`] produced back into the instant it names.
+///
+/// `None` for anything that is not exactly that shape. The one caller
+/// hands it stamps [`match_generation`] already accepted, so `None` there
+/// is a bug rather than a case, and it is treated as "no rotation on
+/// record" rather than panicked on.
+pub fn unstamp_utc(stamp: &str) -> Option<SystemTime> {
+    if !is_stamp(stamp.as_bytes()) {
+        return None;
+    }
+    let civil = jiff::civil::DateTime::strptime(STAMP_FORMAT, stamp).ok()?;
+    let zoned = civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    Some(SystemTime::from(zoned.timestamp()))
+}
+
 /// Build the dated name for a generation: `{stem}.{stamp}.{ext}`, or
 /// `{stem}.{stamp}.{counter}.{ext}` when `counter` is 1 or more.
 ///
@@ -1064,6 +1079,29 @@ mod tests {
                 Some((Order::Numeric { n }, false)),
                 "{name} did not match itself back"
             );
+        }
+    }
+
+    #[test]
+    fn every_stamp_reads_back_to_the_second_it_named() {
+        for secs in [0, 1, 951_782_400, 1_787_324_645, 4_102_444_800] {
+            let at = std::time::UNIX_EPOCH + core::time::Duration::from_secs(secs);
+            let stamp = stamp_utc(at);
+            assert_eq!(unstamp_utc(&stamp), Some(at), "{stamp}");
+        }
+        // Sub-second precision is not in the stamp, so it is not read back.
+        let uneven = std::time::UNIX_EPOCH + core::time::Duration::from_millis(1_787_324_645_750);
+        assert_eq!(
+            unstamp_utc(&stamp_utc(uneven)),
+            Some(std::time::UNIX_EPOCH + core::time::Duration::from_secs(1_787_324_645))
+        );
+        for junk in [
+            "",
+            "2026-08-21",
+            "2026-08-21T15:04:05",
+            "2026-02-30T00-00-00",
+        ] {
+            assert_eq!(unstamp_utc(junk), None, "{junk:?}");
         }
     }
 

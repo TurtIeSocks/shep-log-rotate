@@ -69,7 +69,7 @@ uncomment something.
 ```toml
 [dog.log-rotate]
 max_size = "10M"    # rotate once a log reaches this size
-max_age  = "168h"   # optionally also rotate on age, whatever the size
+max_age  = "168h"   # optionally also rotate this long after the last rotation
 keep     = 5        # rotated generations to keep, at least 1
 naming   = "dated"  # "dated" or "numeric", see below
 compress = true     # gzip all but the newest generation
@@ -79,7 +79,7 @@ interval = "60s"    # how often to look
 | Option | Default | Notes |
 | --- | --- | --- |
 | `max_size` | `"10M"` | shep's size grammar: `K`, `M`, `G`, uppercase, binary. `10M` is 10 MiB. `10MB` is refused. |
-| `max_age` | unset | Age alone is enough to rotate a log that never reached `max_size`. Unset means size only. |
+| `max_age` | unset | Rotates a log this long after its last rotation, whatever its size, or after it first appeared if it never has. Unset means size only. |
 | `keep` | `5` | Counts rotated generations, never the live file. `keep = 0` is refused, since it would delete each rotation as it was made. |
 | `naming` | `"dated"` | See below. |
 | `compress` | `true` | The newest generation is left plain so it still greps without a decompression step. |

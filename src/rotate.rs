@@ -9,7 +9,9 @@ use std::{fs, io, path::Path, path::PathBuf, time::SystemTime};
 use crate::{
     config::Naming,
     error::Error,
-    naming::{LogPath, Order, dated_name, match_generation, numeric_name, stamp_utc, with_gz},
+    naming::{
+        LogPath, Order, dated_name, match_generation, numeric_name, stamp_utc, unstamp_utc, with_gz,
+    },
 };
 
 /// One file on disk that [`generations`] recognised as a generation of its
@@ -28,20 +30,29 @@ pub struct GenerationFile {
     pub compressed: bool,
 }
 
-/// Every generation this dog created for `base`, newest first.
+/// The names of the regular files in `dir`, and only those.
 ///
-/// A missing log directory is not an error: a sheep that is registered but
+/// A missing directory is not an error: a sheep that is registered but
 /// never started has no log file yet, so this returns an empty list rather
-/// than failing.
-pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<GenerationFile>, Error> {
-    let entries = match fs::read_dir(&base.dir) {
+/// than failing. Anything that is not a regular file, and any name that is
+/// not UTF-8, is left out: see [`generations`] for why neither can be a
+/// generation this dog wrote.
+///
+/// Split from [`generations`] so a tick can list a directory once and ask
+/// about every base in it.
+///
+/// # Errors
+/// [`Error::Io`], naming the directory, if it cannot be listed for any
+/// reason but not existing.
+pub fn regular_files(dir: &Path) -> Result<Vec<String>, Error> {
+    let entries = match fs::read_dir(dir) {
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        listing => listing.map_err(Error::io_at(&base.dir))?,
+        listing => listing.map_err(Error::io_at(dir))?,
     };
 
-    let mut found = Vec::new();
+    let mut names = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(Error::io_at(&base.dir))?;
+        let entry = entry.map_err(Error::io_at(dir))?;
         // Only a regular file can be a generation this dog wrote.
         // match_generation matches by name alone, so anything else that
         // merely collides with a generation's name shape - an operator's own
@@ -68,21 +79,56 @@ pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<GenerationFile>
         // UTF-8), so match_generation could never match it. Skip rather than
         // fail: an unrelated file with a non-UTF-8 name is not this dog's
         // problem to name in an error.
-        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Some((order, compressed)) = match_generation(base, naming, &file_name) else {
-            continue;
-        };
-        found.push(GenerationFile {
-            path: base.dir.join(&file_name),
-            order,
-            compressed,
-        });
+        names.push(name);
     }
+    Ok(names)
+}
 
+/// Every generation of `base` among `names`, newest first. `names` is what
+/// [`regular_files`] listed for `base.dir`.
+pub fn generations_from(names: &[String], base: &LogPath, naming: Naming) -> Vec<GenerationFile> {
+    let mut found: Vec<GenerationFile> = names
+        .iter()
+        .filter_map(|name| {
+            let (order, compressed) = match_generation(base, naming, name)?;
+            Some(GenerationFile {
+                path: base.dir.join(name),
+                order,
+                compressed,
+            })
+        })
+        .collect();
     found.sort_by(|a, b| Order::newest_first(&a.order, &b.order));
-    Ok(found)
+    found
+}
+
+/// When `base` was last rotated, as far as the directory says, or `None`
+/// if it never was.
+///
+/// A dated generation carries the instant in its name. A numeric one does
+/// not, but its file was last written at the rename-to-reopen boundary, so
+/// its mtime is that instant to within the window, and a rename keeps the
+/// mtime through every later shift. The newest generation is the one
+/// asked, and it is never compressed, so there is no gzip to have rewritten
+/// the mtime.
+pub fn last_rotation(names: &[String], base: &LogPath, naming: Naming) -> Option<SystemTime> {
+    let newest = generations_from(names, base, naming).into_iter().next()?;
+    match newest.order {
+        Order::Dated { stamp, .. } => unstamp_utc(&stamp),
+        Order::Numeric { .. } => fs::metadata(&newest.path).ok()?.modified().ok(),
+    }
+}
+
+/// Every generation this dog created for `base`, newest first.
+///
+/// A missing log directory is not an error: a sheep that is registered but
+/// never started has no log file yet, so this returns an empty list rather
+/// than failing.
+pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<GenerationFile>, Error> {
+    Ok(generations_from(&regular_files(&base.dir)?, base, naming))
 }
 
 /// Rename the live file at `base` to its next generation, returning the path
@@ -186,7 +232,10 @@ fn rename(from: &Path, to: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Naming, test_support::seed};
+    use crate::{
+        config::Naming,
+        test_support::{live_log, seed},
+    };
     use std::fs;
 
     /// Serialises the two tests that have to run from inside a temporary
@@ -399,6 +448,65 @@ mod tests {
         );
         assert!(found[0].path.to_str().expect("utf8").contains("15-04-06"));
         assert!(found[1].path.to_str().expect("utf8").contains("15-04-05"));
+    }
+
+    #[test]
+    fn the_last_rotation_of_a_dated_base_is_its_newest_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-05.log", "older\n");
+        seed(
+            dir.path(),
+            "web-0-out.2026-08-21T15-04-05.log.gz",
+            "newer, compressed\n",
+        );
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+        let names = regular_files(dir.path()).expect("listed");
+
+        let expected = std::time::UNIX_EPOCH + core::time::Duration::from_secs(1_787_324_645);
+        assert_eq!(last_rotation(&names, &base, Naming::Dated), Some(expected));
+        assert_eq!(
+            last_rotation(&names, &base, Naming::Numeric),
+            None,
+            "the other scheme's files are not this scheme's rotations"
+        );
+    }
+
+    #[test]
+    fn the_last_rotation_of_a_numeric_base_is_when_dot_one_was_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let newest = seed(dir.path(), "web-0-out.log.1", "newest\n");
+        seed(dir.path(), "web-0-out.log.2", "older\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+        let eight_days_ago = SystemTime::now() - core::time::Duration::from_secs(8 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&newest)
+            .expect("open")
+            .set_modified(eight_days_ago)
+            .expect("mtime set");
+        let names = regular_files(dir.path()).expect("listed");
+
+        let since = last_rotation(&names, &base, Naming::Numeric).expect("rotated once");
+        let drift = eight_days_ago
+            .duration_since(since)
+            .or_else(|_| since.duration_since(eight_days_ago))
+            .expect("comparable");
+        assert!(drift < core::time::Duration::from_secs(2), "{drift:?}");
+    }
+
+    #[test]
+    fn a_base_never_rotated_has_no_last_rotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed(dir.path(), "unrelated.log.1", "not ours\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+        let names = regular_files(dir.path()).expect("listed");
+        assert_eq!(last_rotation(&names, &base, Naming::Dated), None);
+        assert_eq!(last_rotation(&names, &base, Naming::Numeric), None);
+        assert!(
+            regular_files(&dir.path().join("nowhere"))
+                .expect("missing is empty")
+                .is_empty()
+        );
     }
 
     #[test]

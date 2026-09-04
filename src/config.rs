@@ -25,7 +25,8 @@ pub enum Naming {
 pub struct Config {
     /// Rotate a log once it reaches this size.
     pub max_size: MemSize,
-    /// Optionally also rotate on age, whatever the size.
+    /// Optionally also rotate this long after the last rotation, whatever
+    /// the size.
     pub max_age: Option<UpDuration>,
     /// Generations to keep. Older ones are deleted.
     pub keep: usize,
@@ -226,8 +227,9 @@ impl Config {
 pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
 # Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
 #max_size = "10M"
-# Optionally also rotate on age, whatever the size. Unset means size only.
-# shep's UpDuration has no day unit: spell a week as hours, not "7d".
+# Optionally also rotate this long after the last rotation, whatever the
+# size. Unset means size only. shep's UpDuration has no day unit: spell a
+# week as hours, not "7d".
 #max_age = "168h"
 # Generations to keep. Older ones are deleted. Must be at least 1.
 #keep = 5
