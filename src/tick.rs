@@ -107,6 +107,10 @@ pub trait Daemon {
 /// afterwards, which is why the two "left alone" counts are separate: one
 /// says a rename was refused, the other says a compression or a deletion
 /// was, and they have different causes.
+///
+/// `Debug` is derived, deliberately, for the reason [`Error`] gives: every
+/// message in the fault lists is printed for the operator on the summary
+/// line, and the path in it is the diagnostic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// Live log paths renamed. Counts paths, not sheep: two sheep sharing

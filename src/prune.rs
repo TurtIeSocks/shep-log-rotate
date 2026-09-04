@@ -29,6 +29,12 @@ use crate::{
 };
 
 /// What one pass of [`tidy`] did.
+///
+/// `Debug` is derived, deliberately, on the reasoning [`Error`] gives for
+/// its own: every message in `faults` is printed for the operator on the
+/// tick's summary line, and the path in it is the diagnostic. Redacting it
+/// from `Debug` would hide from a maintainer what a user is shown anyway.
+/// Pinned by `debug_carries_the_fault_paths`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tidied {
     /// Files gzipped on this pass. A generation is compressed at most once,
@@ -184,7 +190,7 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
                 // unrecorded, the prune would remove the plain file alone
                 // and the truncated archive would stand in for the
                 // generation for good.
-                if target.is_file() {
+                if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file()) {
                     generation.gz = Some(target);
                 }
                 continue;
@@ -235,6 +241,16 @@ fn is_protected(names: &BTreeSet<String>, path: &Path) -> bool {
 /// Only the empty file is ever at the creation mode, and the handle keeps
 /// its write access across the change, so a read-only mode still works here.
 fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
+    // `File::create` follows a symlink, and would truncate and fill whatever
+    // one planted at the target's name points at, anywhere on disk. Nothing
+    // this dog writes is a symlink, so one sitting here is somebody else's
+    // and is refused rather than written through. A check before the create
+    // rather than `O_NOFOLLOW`, which std does not spell portably.
+    if fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(Error::io_at(target)(io::Error::other(
+            "is a symlink, and this dog does not write through one",
+        )));
+    }
     let file = fs::File::create(target).map_err(Error::io_at(target))?;
     fs::set_permissions(target, permissions).map_err(Error::io_at(target))?;
     Ok(file)
@@ -754,6 +770,55 @@ mod tests {
                 .exists()
         );
         assert!(blocker.is_dir(), "the blocker is not this dog's to remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_gz_target_is_refused_not_written_through() {
+        // Somebody planted a link where this generation's archive goes.
+        // Creating the archive through it would truncate and fill whatever
+        // it points at, anywhere on disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = seed(dir.path(), "elsewhere.txt", "somebody else's file\n");
+        let plain = seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "ours\n");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let link = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("linked");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
+
+        assert_eq!(tidied.compressed, 0);
+        assert_eq!(tidied.faults.len(), 1, "{:?}", tidied.faults);
+        assert!(tidied.faults[0].contains("symlink"), "{:?}", tidied.faults);
+        assert_eq!(
+            fs::read_to_string(&elsewhere).expect("untouched"),
+            "somebody else's file\n"
+        );
+        assert!(plain.exists(), "the generation is left plain");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "and the link is not this dog's to remove"
+        );
+    }
+
+    #[test]
+    fn debug_carries_the_fault_paths() {
+        // The derived shape is the documented decision: the path is what an
+        // operator is shown on the summary line, so Debug shows it too.
+        let tidied = Tidied {
+            faults: vec!["/var/log/web-0-out.2026-08-20T15-04-01.log.gz: is a symlink".into()],
+            ..Tidied::default()
+        };
+        let shown = format!("{tidied:?}");
+        assert!(
+            shown.contains("/var/log/web-0-out.2026-08-20T15-04-01.log.gz"),
+            "{shown}"
+        );
     }
 
     #[test]
