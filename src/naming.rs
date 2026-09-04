@@ -61,9 +61,11 @@ impl LogPath {
     /// second copy of this rule somewhere downstream is a copy that can be
     /// missing from a third place.
     ///
-    /// Returns `None` if `path` has no file name, or if the file name or its
-    /// directory is not valid UTF-8. A path this dog cannot spell is a path
-    /// it must not go on to rename or delete.
+    /// Returns `None` if `path` has no file name, or if the file name is not
+    /// valid UTF-8. A name this dog cannot spell is a name it must not go on
+    /// to build generations from, rename, or delete. The directory is kept
+    /// as it came, UTF-8 or not: it is only ever joined and compared, never
+    /// spelled into a name.
     pub fn split(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
         // `file_stem`/`extension` already implement "the final extension,
