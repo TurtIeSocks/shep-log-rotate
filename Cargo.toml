@@ -33,7 +33,7 @@ integration = []
 # serves every request correctly and is still rendered `silent`, restarted
 # once, and then declared stale. See the module docs in src/main.rs.
 shep-client = "0.1.23"
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal", "sync"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }

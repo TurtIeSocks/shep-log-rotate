@@ -39,7 +39,7 @@
 //! [`prune::tidy`]: crate::prune::tidy
 
 use core::fmt;
-use std::{collections::BTreeMap, fs, path::Path, time::SystemTime};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::SystemTime};
 
 use shep_client::{
     LinkState, ReconnectingClient,
@@ -53,6 +53,7 @@ use crate::{
     naming::{LogPath, match_generation},
     prune::tidy,
     rotate::rotate,
+    stop::Stop,
 };
 
 /// The three things one tick asks the shepherd for.
@@ -202,6 +203,14 @@ impl Report {
 ///    reopened would read a file mid-append and then delete what shep is
 ///    writing to.
 ///
+/// `stop` is consulted from the tidy loop and nowhere else. The renames and
+/// the reopens are quick, and a tick interrupted between a rename and its
+/// reopen leaves shep writing into a file with the wrong name, which is
+/// worse than the wait. The gzip of a large generation is the slow part: it
+/// runs on a blocking thread, a stop already requested when its turn comes
+/// skips it, and a stop arriving while it runs abandons it. The half-written
+/// `.gz` an abandoned gzip leaves is the state the next pass recovers from.
+///
 /// # Errors
 /// - [`Error::Config`] if the `[dog.<name>]` section cannot be understood.
 ///   Nothing is touched in that case; the tick reads the config first for
@@ -220,6 +229,7 @@ pub async fn tick<D: Daemon>(
     daemon: &D,
     dog_name: &str,
     now: SystemTime,
+    stop: &mut Stop,
 ) -> Result<(Config, Report), Error> {
     // Named at the point of failure rather than through a `From` impl: the
     // section is `[dog.<name>]` for whatever this dog was adopted as, and an
@@ -233,7 +243,9 @@ pub async fn tick<D: Daemon>(
     let flock = daemon.list_flock().await?;
     // Every live log path the flock reported, in one set, because the
     // collision it exists to catch is between different sheep.
-    let protected = FileSet::from_paths(flock.iter().flat_map(log_paths).map(Path::new));
+    let protected = Arc::new(FileSet::from_paths(
+        flock.iter().flat_map(log_paths).map(Path::new),
+    ));
     let mut report = Report::default();
 
     // Qualify the whole flock before renaming anything. Two sheep can share
@@ -364,7 +376,7 @@ pub async fn tick<D: Daemon>(
         });
     }
 
-    let tidied = tidy_all(&to_tidy, &config, &protected, &mut report);
+    let tidied = tidy_all(&to_tidy, &config, &protected, &mut report, stop).await;
     if let Some(err) = halt {
         return Err(err);
     }
@@ -374,16 +386,52 @@ pub async fn tick<D: Daemon>(
 
 /// Compress and prune each of `bases`, adding what happened to `report`.
 ///
-/// Counts already added stay added when a later base fails: they describe
-/// work that was done.
-fn tidy_all(
+/// Each base is tidied on a blocking thread rather than on the runtime's
+/// own. This binary runs one current-thread runtime, and the client's
+/// supervisor lives on it: a gzip run in place would hold that thread for
+/// as long as the gzip takes, so a shepherd restarting underneath a large
+/// compression would not be reconnected to until it finished, and the next
+/// tick would fail for it. Off the thread, the supervisor reconnects while
+/// the gzip runs.
+///
+/// A stop already requested when a base's turn comes skips it and every
+/// base after it. A stop arriving while a gzip runs abandons that gzip: the
+/// thread finishes or is cut off when the process exits, and either way
+/// the plain file is still there, since it is removed only after the `.gz`
+/// is complete and synced. Whatever was already counted stays counted; it
+/// describes work that was done.
+async fn tidy_all(
     bases: &[LogPath],
     config: &Config,
-    protected: &FileSet,
+    protected: &Arc<FileSet>,
     report: &mut Report,
+    stop: &mut Stop,
 ) -> Result<(), Error> {
     for base in bases {
-        let tidied = tidy(base, config, protected)?;
+        if stop.requested() {
+            return Ok(());
+        }
+        let gzip = tokio::task::spawn_blocking({
+            let (base, config, protected) = (base.clone(), config.clone(), Arc::clone(protected));
+            move || tidy(&base, &config, &protected)
+        });
+        let joined = tokio::select! {
+            joined = gzip => joined,
+            () = stop.wait() => return Ok(()),
+        };
+        let tidied = match joined {
+            Ok(tidied) => tidied?,
+            Err(join) => match join.try_into_panic() {
+                // A panic in tidy is a bug, and it is re-raised here so the
+                // process fails the way it would have with tidy in place.
+                Ok(payload) => std::panic::resume_unwind(payload),
+                // A blocking task is cancelled only by a runtime shutting
+                // down, and this future has been dropped by then.
+                Err(join) => {
+                    unreachable!("a blocking task was cancelled under a live runtime: {join}")
+                }
+            },
+        };
         report.compressed += tidied.compressed;
         report.deleted += tidied.deleted;
         report.skipped_protected += tidied.skipped_protected;
@@ -648,6 +696,11 @@ mod tests {
             .build()
     }
 
+    /// One tick against `fake`, with a stop nothing will ever request.
+    async fn run(fake: &Fake, now: SystemTime) -> Result<(Config, Report), Error> {
+        tick(fake, "log-rotate", now, &mut Stop::never()).await
+    }
+
     /// A `now` a year ahead of the clock, so a file written moments ago is
     /// unambiguously older than any `max_age` a test sets.
     fn a_year_on() -> SystemTime {
@@ -661,9 +714,7 @@ mod tests {
         fs::write(&out, "x".repeat(2048)).expect("seeded");
         let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 1);
         assert!(!out.exists(), "the live path is free for shep to reopen");
@@ -677,9 +728,7 @@ mod tests {
         fs::write(&out, "small\n").expect("seeded");
         let fake = Fake::new("max_size = \"1M\"\n", vec![sheep("web", Some(&out), None)]);
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0);
         assert!(out.exists());
@@ -701,7 +750,7 @@ mod tests {
             )],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+        let (_config, report) = run(&fake, SystemTime::now())
             .await
             .expect("a missing log file is ordinary");
 
@@ -727,7 +776,7 @@ mod tests {
             )
         };
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+        let (_config, report) = run(&fake, SystemTime::now())
             .await
             .expect("a refused reopen is reported, not returned as an error");
 
@@ -756,9 +805,7 @@ mod tests {
             ],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 1, "one path, one rename");
         let reopened = fake.reopened.borrow().clone();
@@ -775,9 +822,7 @@ mod tests {
             "max_size = \"1G\"\nmax_age = \"1s\"\n",
             vec![sheep("web", Some(&out), None)],
         );
-        let (_config, report) = tick(&fake, "log-rotate", a_year_on())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, a_year_on()).await.expect("ticked");
 
         assert_eq!(report.rotated, 1);
     }
@@ -792,7 +837,7 @@ mod tests {
             vec![sheep("web", Some(&out), None)],
         );
 
-        tick(&fake, "log-rotate", SystemTime::now())
+        run(&fake, SystemTime::now())
             .await
             .expect_err("10MB is not a spelling shep accepts");
 
@@ -825,9 +870,7 @@ mod tests {
             ],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0, "neither log may be renamed");
         assert_eq!(report.skipped_collision, 1, "the collision is reported");
@@ -870,9 +913,7 @@ mod tests {
             ],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0, "neither log may be renamed");
         assert_eq!(
@@ -903,9 +944,7 @@ mod tests {
             ],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0);
         assert_eq!(report.skipped_collision, 1);
@@ -931,7 +970,7 @@ mod tests {
             vec![sheep("api", Some(&out), Some(&err))],
         );
 
-        let failure = tick(&fake, "log-rotate", SystemTime::now())
+        let failure = run(&fake, SystemTime::now())
             .await
             .expect_err("no generation numbers left");
 
@@ -955,9 +994,7 @@ mod tests {
             "max_size = \"1G\"\nmax_age = \"1s\"\n",
             vec![sheep("web", Some(&out), None)],
         );
-        let (_config, report) = tick(&fake, "log-rotate", a_year_on())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, a_year_on()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0);
         assert!(out.exists());
@@ -1009,7 +1046,7 @@ mod tests {
             ],
         );
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+        let (_config, report) = run(&fake, SystemTime::now())
             .await
             .expect("one file under two spellings is one rotation, not an error");
 
@@ -1054,7 +1091,7 @@ mod tests {
             )
         };
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
+        let (_config, report) = run(&fake, SystemTime::now())
             .await
             .expect("a refused reopen is reported, not returned as an error");
 
@@ -1092,9 +1129,7 @@ mod tests {
             )
         };
 
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
-            .await
-            .expect("ticked");
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 1);
         assert!(report.reopen_failed.is_some());
@@ -1123,7 +1158,7 @@ mod tests {
             vec![sheep("api", Some(&out), Some(&err))],
         );
 
-        let failure = tick(&fake, "log-rotate", SystemTime::now())
+        let failure = run(&fake, SystemTime::now())
             .await
             .expect_err("no generation numbers left");
 
@@ -1136,6 +1171,81 @@ mod tests {
         assert!(
             !dir.path().join("api-0-out.log.2").exists(),
             "the old generation, shifted to .2, was past keep = 1 and went"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_before_the_tidy_skips_it() {
+        // The renames and the reopen are quick and must not be interrupted:
+        // a sheep left between the two writes into a file with the wrong
+        // name. The gzip afterwards is the slow part, and a stop already
+        // requested when the tidy loop starts means none of it runs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "x".repeat(2048)).expect("seeded");
+        let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        fs::write(&older, "would be gzipped\n").expect("seeded");
+        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
+        let (mut stop, request) = Stop::new();
+        request.request();
+
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
+            .await
+            .expect("ticked");
+
+        assert_eq!(report.rotated, 1, "the rename still happened");
+        assert_eq!(
+            *fake.reopened.borrow(),
+            vec!["web".to_owned()],
+            "and the reopen"
+        );
+        assert_eq!(report.compressed, 0, "but nothing was compressed");
+        assert!(older.exists(), "the older generation is still plain");
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-01.log.gz")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_during_a_gzip_abandons_it() {
+        // 32 MiB of noise takes well over half a second to deflate. The stop
+        // arrives after a fifth of one, and the tick must come back on the
+        // stop rather than on the gzip. Whatever the abandoned thread writes
+        // afterwards is the half-written .gz the next pass already
+        // overwrites, and the test runtime waits for it on its way out.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "x".repeat(2048)).expect("seeded");
+        let mut noise = vec![0u8; 32 << 20];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for byte in &mut noise {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        fs::write(dir.path().join("web-0-out.2026-08-20T15-04-01.log"), &noise).expect("seeded");
+        drop(noise);
+        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
+        let (mut stop, request) = Stop::new();
+        tokio::spawn(async move {
+            tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+            request.request();
+        });
+
+        let started = std::time::Instant::now();
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
+            .await
+            .expect("ticked");
+        let took = started.elapsed();
+
+        assert_eq!(report.rotated, 1);
+        assert_eq!(report.compressed, 0, "the gzip was abandoned, not counted");
+        assert!(
+            took < core::time::Duration::from_millis(1500),
+            "the tick waited for the gzip rather than the stop: {took:?}"
         );
     }
 }
