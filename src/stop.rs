@@ -40,7 +40,11 @@ impl Stop {
     ///
     /// The listener is a spawned task, so this needs a runtime. If the
     /// handler cannot be installed the dog runs until the shepherd stops it,
-    /// which is how it ran before signals were watched at all.
+    /// which is how it ran before signals were watched at all, and a ctrl-c
+    /// then ends it the way the OS does with no handler in place: at once,
+    /// without the tidy loop's chance to skip or abandon a gzip. Requesting
+    /// a stop on that failure instead would exit a dog nobody asked to stop,
+    /// and the shepherd would restart it into the same failure.
     pub fn on_ctrl_c() -> Self {
         let (stop, request) = Self::new();
         tokio::spawn(async move {

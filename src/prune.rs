@@ -912,6 +912,10 @@ mod tests {
             .expect("the pass must not abort");
 
         assert_eq!(tidied.deleted, 1, "one file left of one generation");
+        // A second removal of the same path would fail NotFound, and that
+        // failure is recorded rather than returned now, so the count alone
+        // no longer proves the twin was removed once.
+        assert!(tidied.faults.is_empty(), "{:?}", tidied.faults);
         assert!(
             dir.path()
                 .join("web-0-out.2026-08-20T15-04-02.log")
