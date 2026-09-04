@@ -82,7 +82,13 @@ impl LogPath {
 
     /// Rebuild the live log path this was split from.
     pub fn live(&self) -> PathBuf {
-        self.dir.join(self.file_name(String::new()))
+        self.dir.join(self.live_name())
+    }
+
+    /// The live log's file name alone: `web-0-out.log` for
+    /// `/var/log/web-0-out.log`.
+    pub fn live_name(&self) -> String {
+        self.file_name(String::new())
     }
 
     /// The file name for this base, with `infix` spliced in before the
@@ -404,6 +410,7 @@ mod tests {
         assert_eq!(split.stem, "web-0-out");
         assert_eq!(split.ext.as_deref(), Some("log"));
         assert_eq!(split.live(), Path::new("/var/log/web-0-out.log"));
+        assert_eq!(split.live_name(), "web-0-out.log");
     }
 
     #[test]

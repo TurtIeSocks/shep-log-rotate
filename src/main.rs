@@ -37,6 +37,7 @@
 
 mod config;
 mod error;
+mod file_set;
 mod naming;
 mod prune;
 mod rotate;

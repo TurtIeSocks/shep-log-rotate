@@ -16,10 +16,10 @@
 //! deleting it: shep keeps writing into a path that no longer exists, and
 //! the operator's log simply stops appearing.
 //!
-//! The second is the `protected` set [`prune::tidy`] takes, built here from
-//! every log path the whole flock reported. The collision is between
-//! DIFFERENT sheep, so a per-sheep set would miss exactly the case that
-//! matters.
+//! The second is the `protected` [`FileSet`] [`prune::tidy`] takes, built
+//! here from every log path the whole flock reported. The collision is
+//! between DIFFERENT sheep, so a per-sheep set would miss exactly the case
+//! that matters.
 //!
 //! # This dog rotates its own logs, on purpose
 //!
@@ -39,12 +39,7 @@
 //! [`prune::tidy`]: crate::prune::tidy
 
 use core::fmt;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{collections::BTreeMap, fs, path::Path, time::SystemTime};
 
 use shep_client::{
     LinkState, ReconnectingClient,
@@ -54,8 +49,9 @@ use shep_client::{
 use crate::{
     config::{Config, Naming},
     error::Error,
+    file_set::{FileSet, ResolvedDir},
     naming::{LogPath, match_generation},
-    prune::{resolve, tidy},
+    prune::tidy,
     rotate::rotate,
 };
 
@@ -228,7 +224,9 @@ pub async fn tick<D: Daemon>(
             source,
         })?;
     let flock = daemon.list_flock().await?;
-    let protected = protected_paths(&flock);
+    // Every live log path the flock reported, in one set, because the
+    // collision it exists to catch is between different sheep.
+    let protected = FileSet::from_paths(flock.iter().flat_map(log_paths).map(Path::new));
     let mut report = Report::default();
 
     // Qualify the whole flock before renaming anything. Two sheep can share
@@ -237,10 +235,7 @@ pub async fn tick<D: Daemon>(
     let mut order: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, Vec<LogPath>> = BTreeMap::new();
     for sheep in &flock {
-        for path in [sheep.out_file.as_deref(), sheep.err_file.as_deref()]
-            .into_iter()
-            .flatten()
-        {
+        for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
             // rename or delete. `LogPath::split` refuses a non-UTF-8 name,
             // and this is where that refusal gets its answer: skip it, count
@@ -274,28 +269,33 @@ pub async fn tick<D: Daemon>(
     // multi-name variant. Per sheep is the better shape anyway, because the
     // rename-to-reopen window is then one sheep wide rather than the whole
     // tick.
-    let mut renamed: BTreeSet<PathBuf> = BTreeSet::new();
+    // A `FileSet` rather than a set of paths, for the same reason `protected`
+    // is one: two sheep can be handed one file under two spellings, and a
+    // second rename of a file that has already moved fails with NotFound and
+    // leaves the second sheep never reopened.
+    let mut renamed = FileSet::default();
     let mut to_tidy: Vec<LogPath> = Vec::new();
     let mut halt: Option<Error> = None;
 
     'flock: for name in &order {
         let mut rotated_any = false;
         for base in &groups[name] {
-            let live = base.live();
-            if renamed.contains(&live) {
+            let dir = ResolvedDir::of(&base.dir);
+            let live_name = base.live_name();
+            if renamed.contains(&dir, &live_name) {
                 // Another sheep shares this path and has already rotated it.
                 // This one is still writing through its own descriptor, so
                 // it still needs the reopen below.
                 rotated_any = true;
                 continue;
             }
-            if collides_with_a_live_log(base, config.naming, &protected) {
+            if collides_with_a_live_log(base, &dir, config.naming, &protected) {
                 report.skipped_collision += 1;
                 continue;
             }
             match rotate(base, config.naming, now) {
                 Ok(_generation) => {
-                    renamed.insert(live);
+                    renamed.insert(dir, live_name);
                     to_tidy.push(base.clone());
                     report.rotated += 1;
                     rotated_any = true;
@@ -364,56 +364,24 @@ fn qualifies(metadata: &fs::Metadata, config: &Config, now: SystemTime) -> bool 
         .is_ok_and(|age| age >= max_age.as_duration())
 }
 
-/// Every live log path the flock reported, in the one spelling this module
-/// compares by.
-///
-/// Built from the whole flock rather than per sheep because the collision it
-/// exists to catch is between different sheep. See the module docs.
-fn protected_paths(flock: &[ProcessInfo]) -> BTreeSet<PathBuf> {
-    flock
-        .iter()
-        .flat_map(|sheep| [sheep.out_file.as_deref(), sheep.err_file.as_deref()])
+/// The log paths one sheep writes to: `out_file` and `err_file`, whichever
+/// of them are set.
+fn log_paths(sheep: &ProcessInfo) -> impl Iterator<Item = &str> {
+    [sheep.out_file.as_deref(), sheep.err_file.as_deref()]
+        .into_iter()
         .flatten()
-        .map(|path| normalise(Path::new(path)))
-        .collect()
-}
-
-/// The one spelling of a path this module compares by.
-///
-/// Rebuilding the name out of [`LogPath`]'s own pieces is what makes the
-/// comparison line up: `rotate::generations` builds every path it returns as
-/// `dir.join(name)`, and `prune::tidy` compares those paths against
-/// `protected` exactly, with no canonicalisation of its own. Going through
-/// `LogPath` puts both sides through the same code.
-///
-/// `fs::canonicalize` would be the wrong tool here even though it is the
-/// stronger one. It resolves symlinks and needs the file to exist, so its
-/// answers would no longer match what `generations` produces, and the
-/// comparison would silently stop matching anything.
-///
-/// What it does normalise: a redundant separator, and an interior `.`
-/// component, both of which `Path::parent` drops. What it does not: `..`
-/// components, a relative path against an absolute one, a symlinked
-/// directory, a hard link, and case on a case-insensitive filesystem, where
-/// `/var/log/WEB.1` and `/var/log/web.1` are one file with two spellings.
-/// Every path here comes from one `ListFlock` answer, so all of those need
-/// the shepherd to have reported two paths for one file in two different
-/// spellings before they can bite.
-fn normalise(path: &Path) -> PathBuf {
-    LogPath::split(path).map_or_else(|| path.to_path_buf(), |base| base.live())
 }
 
 /// Whether rotating `base` could disturb a path some sheep is using as a
-/// live log.
+/// live log. `dir` is `base.dir`, resolved.
 ///
 /// A `true` here skips the base whole: not rotated, and so not tidied
 /// either.
 ///
-/// This is the guard the brief specified as `rotate::generations(base,
-/// naming)` intersected with `protected`, widened to ask the question by
-/// name instead of by directory listing. Every path `generations` could
-/// return and find in `protected` is a name this matches, and the widening
-/// picks up two cases a listing cannot see:
+/// Asked by name against the flock's own list rather than by listing the
+/// directory and intersecting. Every path `generations` could return and
+/// find in `protected` is a name this matches, and asking by name picks up
+/// two cases a listing cannot see:
 ///
 /// - A sheep that is registered but stopped has no log file, so `generations`
 ///   cannot see its name. Rotating into it would hand that sheep a file full
@@ -421,55 +389,28 @@ fn normalise(path: &Path) -> PathBuf {
 /// - `generations` deliberately skips symlinks and anything that is not a
 ///   regular file, so a live log that is a symlink is invisible to it.
 ///
-/// It also costs one pass over `protected` instead of a `read_dir` per base.
+/// It also costs one lookup instead of a `read_dir` per base.
 ///
-/// The directory is resolved once, here, rather than per candidate: the
-/// comparison below needs it for every member of `protected`, and a
-/// `canonicalize` per member per base is a syscall count that grows with the
-/// square of a large flock.
-fn collides_with_a_live_log(base: &LogPath, naming: Naming, protected: &BTreeSet<PathBuf>) -> bool {
-    let resolved_dir = resolve(&base.dir);
-    protected
-        .iter()
-        .any(|path| is_generation_name_of(base, &resolved_dir, naming, path))
-}
-
-/// Whether `candidate` is a name `base` rotates into, or shifts, under
-/// `naming`. `resolved_dir` is `prune::resolve` of `base.dir`.
-///
-/// The directory comparison resolves, exactly as `prune::tidy`'s own
-/// protection does, and for the reason that one gives: path equality
-/// normalises `.` away but not `..`, and it knows nothing about symlinks.
-/// Two sheep can be handed the same log directory under two spellings, one
-/// through a link and one not, and a raw comparison reads them as different
-/// directories.
-///
-/// Getting that wrong here is worse than getting it wrong in `tidy`, which
-/// is why both halves resolve rather than only the cheaper one. `tidy`
-/// declining to protect a file it should have costs a deletion, which is
-/// visible. This guard declining costs a rename of a file some other sheep
-/// has open, and shep goes on writing into an inode with no name: that
-/// sheep's log simply stops appearing, with nothing logged anywhere to say
-/// why. Measured against a real shepherd before this resolved: two sheep
+/// Getting this wrong is worse than `tidy` getting its own guard wrong,
+/// which is why both consult the same [`FileSet`] rather than each resolving
+/// directories its own way. `tidy` declining to protect a file it should
+/// have costs a deletion, which is visible. This guard declining costs a
+/// rename of a file some other sheep has open, and shep goes on writing
+/// into an inode with no name: that sheep's log simply stops appearing,
+/// with nothing logged anywhere to say why. Measured against a real
+/// shepherd before the two agreed on how a directory is spelled: two sheep
 /// sharing one directory under two spellings, and one of them lost its live
 /// log to the other's rotation on the first tick.
-///
-/// The cheap comparison comes first, so the ordinary case where both sides
-/// were spelled the same way costs no syscall at all.
-fn is_generation_name_of(
+fn collides_with_a_live_log(
     base: &LogPath,
-    resolved_dir: &Path,
+    dir: &ResolvedDir,
     naming: Naming,
-    candidate: &Path,
+    protected: &FileSet,
 ) -> bool {
-    let parent = candidate.parent().unwrap_or_else(|| Path::new(""));
-    if parent != base.dir.as_path() && resolve(parent) != resolved_dir {
-        return false;
-    }
-    candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| match_generation(base, naming, name).is_some())
+    protected
+        .names_in(dir)
+        .iter()
+        .any(|name| match_generation(base, naming, name).is_some())
 }
 
 /// [`Daemon`] over a real connection to the shepherd.
@@ -1004,5 +945,44 @@ mod tests {
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(!line.contains('\u{2014}'), "{line}");
         assert!(!line.contains('\u{2013}'), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_sheep_sharing_one_log_under_two_spellings_rotate_it_once_and_both_reopen() {
+        // The same file, reached through a symlinked directory by one sheep
+        // and directly by the other. Path equality reads those as two files,
+        // so the second rename ran against a path the first had already
+        // moved, failed NotFound, and the second sheep was never reopened:
+        // it went on writing into the renamed generation for good.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("real");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let through_link = link.join("web-out.log");
+        let direct = real.join("web-out.log");
+        fs::write(&direct, "x".repeat(2048)).expect("seeded");
+        let fake = Fake {
+            config: "max_size = \"1K\"\n".into(),
+            flock: vec![
+                sheep("web-0", Some(&through_link), None),
+                sheep("web-1", Some(&direct), None),
+            ],
+            reopen_fails: None,
+            reopened: RefCell::new(Vec::new()),
+        };
+
+        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+            .await
+            .expect("one file under two spellings is one rotation, not an error");
+
+        assert_eq!(report.rotated, 1, "one file, one rename");
+        let reopened = fake.reopened.borrow().clone();
+        assert!(reopened.contains(&"web-0".to_owned()));
+        assert!(
+            reopened.contains(&"web-1".to_owned()),
+            "the second sheep still holds the old descriptor and needs its reopen"
+        );
     }
 }
