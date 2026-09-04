@@ -229,10 +229,11 @@ one that does not is rendered `silent`, restarted once, then declared stale.
 Nothing below 0.1.23 has a public way to send that name.
 
 The floor and the lockfile answer different questions. `^0.1.23` is the oldest
-client this code compiles against. `Cargo.lock` holds 0.1.27, the newest
-published, and that is what a reproducible build of this crate ships: `cargo
-install` honours a packaged lockfile under `--locked`, so that file decides
-what an installer compiles rather than what merely could compile.
+client this code compiles against. `Cargo.lock` pins whichever release was
+newest when it was last refreshed, and that is what a reproducible build of
+this crate ships: `cargo install` honours a packaged lockfile under `--locked`,
+so that file decides what an installer compiles rather than what merely could
+compile.
 
 Depending on the published surface rather than on a path is the point, not an
 accident. This project exists partly to find out whether somebody outside
