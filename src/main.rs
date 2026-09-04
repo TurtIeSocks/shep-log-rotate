@@ -344,8 +344,12 @@ enum Interrupted {
 /// Sleep for `interval`, or until a stop is requested.
 async fn wait(interval: UpDuration, stop: &mut Stop) -> Interrupted {
     tokio::select! {
-        () = tokio::time::sleep(interval.as_duration()) => Interrupted::No,
+        // Biased, stop first: a stop already requested wins over a sleep
+        // that is also ready, rather than the coin toss an unbiased select
+        // would make of it.
+        biased;
         () = stop.wait() => Interrupted::Yes,
+        () = tokio::time::sleep(interval.as_duration()) => Interrupted::No,
     }
 }
 

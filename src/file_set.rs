@@ -28,11 +28,13 @@
 //! for a remembered spelling the way it did when the set was built, so
 //! every guard compares against the same picture of the disk.
 //!
-//! What resolving does not cover: a hard link, and case on a
-//! case-insensitive filesystem, where `/var/log/WEB.1` and `/var/log/web.1`
-//! are one file with two spellings. Every path here comes from one
-//! `ListFlock` answer, so both need the shepherd to have reported one file
-//! two ways before they can bite.
+//! What resolving does not cover: a hard link, a log file that is itself a
+//! symlink to another sheep's log, and case on a case-insensitive
+//! filesystem, where `/var/log/WEB.1` and `/var/log/web.1` are one file
+//! with two spellings. Only the directory is resolved, never the file, so
+//! two names in one directory are two members. Every path here comes from
+//! one `ListFlock` answer, so each of these needs the shepherd to have
+//! reported one file two ways before it can bite.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

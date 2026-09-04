@@ -15,13 +15,15 @@ A log-rotation dog for shep. One binary, one poll loop, no library target.
 - Never build `Request::Flush`. It truncates the recorded paths. `this_dog_never_sends_flush` in `src/main.rs` scans every source file for it.
 - No em dash or en dash in anything printed for a person. `test_support::assert_no_dashes` is the check; use it on any new user-facing string.
 - `Debug` on a type holding a socket path or a secret is written by hand and pinned by an exact-string test. `Live` in `src/tick.rs` is the example.
-- Every fallible `pub fn` has a `# Errors` section. A `# Panics` section needs `#[track_caller]`. Errors implement `core::error::Error`, never `std::error::Error`.
+- Every fallible `pub fn` has a `# Errors` section. A `# Panics` section needs `#[track_caller]`, except on an async fn, where the attribute is a no-op and clippy rejects it; say in the section where the location comes from instead. Errors implement `core::error::Error`, never `std::error::Error`.
 - `#![forbid(unsafe_code)]` at the crate root.
 
 ## Where things live
 
 - `src/tick.rs` is the only module that talks to the daemon. `src/prune.rs` is the only one that deletes a file. `src/naming.rs` is the only place a generation name is built or recognised, and a false match there deletes an operator's data.
 - Directory comparisons go through `file_set::ResolvedDir`, never `PathBuf` equality: `..` and a symlinked directory read as different files otherwise. Both guards and the renamed set share one `FileSet`.
+- `stop::Stop` carries ctrl-c. `tick` consults it only from its tidy loop, where each gzip runs on a blocking thread; the renames and reopens always run to completion. A tick interrupted between a rename and its reopen would leave shep writing into a file with the wrong name, so do not add a stop check there.
+- `max_age` counts from the last rotation, read off the newest generation (`rotate::last_rotation`), then from the file's birth time, then from its last write. Never the last write first: an mtime can predate the rotation it followed.
 - `shep-client` comes by version from crates.io. The floor is 0.1.23, the first release with `connect_as_dog`. The lockfile pins the newest published and is refreshed deliberately.
 
 ## Style

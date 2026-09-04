@@ -79,11 +79,11 @@ interval = "60s"    # how often to look
 | Option | Default | Notes |
 | --- | --- | --- |
 | `max_size` | `"10M"` | shep's size grammar: `K`, `M`, `G`, uppercase, binary. `10M` is 10 MiB. `10MB` is refused. |
-| `max_age` | unset | Rotates a log this long after its last rotation, whatever its size, or after it first appeared if it never has. Unset means size only. |
+| `max_age` | unset | Rotates a log this long after its last rotation, whatever its size. A log never rotated counts from when it appeared, or from its last write on a filesystem that keeps no birth time. Unset means size only. |
 | `keep` | `5` | Counts rotated generations, never the live file. `keep = 0` is refused, since it would delete each rotation as it was made. |
 | `naming` | `"dated"` | See below. |
 | `compress` | `true` | The newest generation is left plain so it still greps without a decompression step. |
-| `interval` | `"60s"` | How long between passes. |
+| `interval` | `"60s"` | How long between passes. `0` is refused. |
 
 `max_age` and `interval` use shep's duration grammar, which has hours,
 minutes and seconds in lowercase and no day unit at all. A week is `"168h"`,

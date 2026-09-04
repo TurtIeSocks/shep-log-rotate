@@ -112,13 +112,20 @@ pub fn generations_from(names: &[String], base: &LogPath, naming: Naming) -> Vec
 /// not, but its file was last written at the rename-to-reopen boundary, so
 /// its mtime is that instant to within the window, and a rename keeps the
 /// mtime through every later shift. The newest generation is the one
-/// asked, and it is never compressed, so there is no gzip to have rewritten
-/// the mtime.
+/// asked, and this dog never compresses it, so no gzip of its own has
+/// rewritten the mtime. An operator's `gzip -k` on it leaves a `.gz` twin
+/// with the same order and the operator's timestamp, so among twins the
+/// plain file is the one asked.
 pub fn last_rotation(names: &[String], base: &LogPath, naming: Naming) -> Option<SystemTime> {
-    let newest = generations_from(names, base, naming).into_iter().next()?;
-    match newest.order {
-        Order::Dated { stamp, .. } => unstamp_utc(&stamp),
-        Order::Numeric { .. } => fs::metadata(&newest.path).ok()?.modified().ok(),
+    let found = generations_from(names, base, naming);
+    let newest = found.first()?;
+    let asked = found
+        .iter()
+        .find(|twin| twin.order == newest.order && !twin.compressed)
+        .unwrap_or(newest);
+    match &asked.order {
+        Order::Dated { stamp, .. } => unstamp_utc(stamp),
+        Order::Numeric { .. } => fs::metadata(&asked.path).ok()?.modified().ok(),
     }
 }
 
@@ -481,6 +488,32 @@ mod tests {
         fs::File::options()
             .write(true)
             .open(&newest)
+            .expect("open")
+            .set_modified(eight_days_ago)
+            .expect("mtime set");
+        let names = regular_files(dir.path()).expect("listed");
+
+        let since = last_rotation(&names, &base, Naming::Numeric).expect("rotated once");
+        let drift = eight_days_ago
+            .duration_since(since)
+            .or_else(|_| since.duration_since(eight_days_ago))
+            .expect("comparable");
+        assert!(drift < core::time::Duration::from_secs(2), "{drift:?}");
+    }
+
+    #[test]
+    fn a_hand_made_gz_twin_of_dot_one_does_not_speak_for_the_rotation() {
+        // `gzip -k web-0-out.log.1` by an operator leaves .1 and .1.gz side
+        // by side with the same Order. The plain one's mtime is the
+        // rotation; the .gz's is whenever the operator ran gzip.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = seed(dir.path(), "web-0-out.log.1", "newest\n");
+        seed(dir.path(), "web-0-out.log.1.gz", "the operator's copy\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+        let eight_days_ago = SystemTime::now() - core::time::Duration::from_secs(8 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(&plain)
             .expect("open")
             .set_modified(eight_days_ago)
             .expect("mtime set");
