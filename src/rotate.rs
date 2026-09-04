@@ -19,22 +19,13 @@ use crate::{
 /// than failing.
 pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<(PathBuf, Order, bool)>, Error> {
     let entries = match fs::read_dir(&base.dir) {
-        Ok(entries) => entries,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(Error::Io {
-                path: base.dir.clone(),
-                source,
-            });
-        }
+        listing => listing.map_err(Error::io_at(&base.dir))?,
     };
 
     let mut found = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| Error::Io {
-            path: base.dir.clone(),
-            source,
-        })?;
+        let entry = entry.map_err(Error::io_at(&base.dir))?;
         // Only a regular file can be a generation this dog wrote.
         // match_generation matches by name alone, so anything else that
         // merely collides with a generation's name shape - an operator's own
@@ -164,10 +155,7 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
 /// `fs::rename`, mapping its error through `Error::Io` naming the source
 /// path - the one a caller is most likely investigating on disk.
 fn rename(from: &Path, to: &Path) -> Result<(), Error> {
-    fs::rename(from, to).map_err(|source| Error::Io {
-        path: from.to_path_buf(),
-        source,
-    })
+    fs::rename(from, to).map_err(Error::io_at(from))
 }
 
 #[cfg(test)]

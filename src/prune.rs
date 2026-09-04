@@ -255,14 +255,8 @@ pub(crate) fn resolve(path: &Path) -> PathBuf {
 /// Only the empty file is ever at the creation mode, and the handle keeps
 /// its write access across the change, so a read-only mode still works here.
 fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
-    let file = fs::File::create(target).map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(target, permissions).map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
+    let file = fs::File::create(target).map_err(Error::io_at(target))?;
+    fs::set_permissions(target, permissions).map_err(Error::io_at(target))?;
     Ok(file)
 }
 
@@ -282,33 +276,15 @@ fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Resul
 /// Permissions come across with the bytes, and ahead of them. A log written
 /// 0600 because it carries something private stays 0600 once compressed.
 fn compress(path: &Path, target: &Path) -> Result<(), Error> {
-    let mut source = fs::File::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let permissions = source
-        .metadata()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .permissions();
+    let mut source = fs::File::open(path).map_err(Error::io_at(path))?;
+    let permissions = source.metadata().map_err(Error::io_at(path))?.permissions();
 
     let sink = create_with_permissions(target, permissions)?;
 
     let mut encoder = GzEncoder::new(sink, Compression::default());
-    io::copy(&mut source, &mut encoder).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let sink = encoder.finish().map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    sink.sync_all().map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
+    io::copy(&mut source, &mut encoder).map_err(Error::io_at(path))?;
+    let sink = encoder.finish().map_err(Error::io_at(target))?;
+    sink.sync_all().map_err(Error::io_at(target))?;
 
     remove(path)
 }
@@ -317,10 +293,7 @@ fn compress(path: &Path, target: &Path) -> Result<(), Error> {
 ///
 /// The one line in this binary that destroys data.
 fn remove(path: &Path) -> Result<(), Error> {
-    fs::remove_file(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    fs::remove_file(path).map_err(Error::io_at(path))
 }
 
 #[cfg(test)]
