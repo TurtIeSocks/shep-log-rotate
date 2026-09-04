@@ -147,13 +147,18 @@ pub struct Report {
     /// sheep or a later one writes to was compressed or pruned. What the
     /// sheep before it had reopened was still tidied.
     pub reopen_failed: Option<String>,
-    /// The rename that failed, and why. Set means the tick stopped early in
-    /// the same way: the sheep was reopened for whatever it did rotate, no
-    /// further sheep was rotated, and what every sheep before it had
-    /// reopened was still tidied. A rename that fails leaves the live file
-    /// where it was, so nothing is lost, and the fault recurs next tick if
+    /// Renames that failed, one message each. A rename that fails leaves
+    /// the live file where it was, so nothing is lost and that log is simply
+    /// not rotated this tick; the next log is. The sheep is reopened only if
+    /// something else of its did rotate, and a sheep not reopened has every
+    /// path it writes to left alone by tidy. The fault recurs next tick if
     /// it persists.
-    pub rename_failed: Option<String>,
+    pub rename_failed: Vec<String>,
+    /// Compressions and deletions that failed, one message each. The
+    /// generation stays as it was: a compression removes the plain file
+    /// only after the `.gz` is complete and synced. The next base is still
+    /// tidied.
+    pub tidy_failed: Vec<String>,
     /// Log directories that could not be listed to read a log's age, one
     /// message each, and the logs in them left unrotated. Anything here
     /// wants a human: it is a permissions problem, and tidy would fail on
@@ -175,7 +180,8 @@ impl Report {
         if self.rotated == 0
             && self.skipped_collision == 0
             && self.reopen_failed.is_none()
-            && self.rename_failed.is_none()
+            && self.rename_failed.is_empty()
+            && self.tidy_failed.is_empty()
             && self.unlistable.is_empty()
         {
             return None;
@@ -199,14 +205,17 @@ impl Report {
         if let Some(why) = &self.reopen_failed {
             line.push_str(&format!(", stopped early: reopen refused ({why})"));
         }
-        if let Some(why) = &self.rename_failed {
-            line.push_str(&format!(", stopped early: rename failed ({why})"));
-        }
-        if let Some(first) = self.unlistable.first() {
-            line.push_str(&format!(
-                ", left {} alone in a log directory that could not be listed ({first})",
-                self.unlistable.len()
-            ));
+        for (what, faults) in [
+            ("rename", &self.rename_failed),
+            ("compress or delete", &self.tidy_failed),
+            ("list a log directory", &self.unlistable),
+        ] {
+            if let Some(first) = faults.first() {
+                line.push_str(&format!(
+                    ", failed {} times to {what} ({first})",
+                    faults.len()
+                ));
+            }
         }
         Some(line)
     }
@@ -252,12 +261,14 @@ impl Report {
 ///   error: it is reported in [`Report::reopen_failed`], because shep is
 ///   still writing into the renamed file through its existing descriptor, so
 ///   nothing is lost and the next successful reopen recovers.
-/// - [`Error::Io`] from a compression or a deletion. A failed *rename* is
-///   not an error either: it is reported in [`Report::rename_failed`],
-///   because the live file it failed on is still where it was, the sheep
-///   it half rotated is reopened, and what every sheep before it reopened
-///   is still tidied. Returning it instead would have thrown the rest of
-///   the report away with it.
+///
+/// A fault on disk is never an error from here: a rename, a compression, a
+/// deletion or a directory listing that fails is that one log's problem,
+/// reported in the [`Report`] beside everything else the tick did, and the
+/// next log is still handled. Returning it instead would throw the rest
+/// of the report away with it, and let one directory's permission bit stop
+/// every other sheep's rotation. Only the daemon can stop a tick: a config
+/// it cannot read, a request it cannot make, or a reopen it is refused.
 ///
 /// # Panics
 /// If `prune::tidy` panics on its blocking thread. The panic is re-raised
@@ -294,8 +305,15 @@ pub async fn tick<D: Daemon>(
     let mut order: Vec<String> = Vec::new();
     let mut groups: BTreeMap<String, Vec<LogPath>> = BTreeMap::new();
     // Each log directory's listing, read at most once per tick, for the
-    // logs whose age has to be read off their newest generation.
-    let mut listings: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    // logs whose age has to be read off their newest generation. `None`
+    // is a directory that refused to be listed, already reported.
+    let mut listings: BTreeMap<PathBuf, Option<Vec<String>>> = BTreeMap::new();
+    // One verdict per file, however many sheep write to it. Two sheep
+    // sharing a log have to agree on whether it rotates: a file crossing
+    // `max_size` between two stats would otherwise leave the first sheep
+    // out of the loop below, never reopened, and writing into the file the
+    // second one renamed.
+    let mut verdicts: BTreeMap<(ResolvedDir, String), Verdict> = BTreeMap::new();
     for sheep in &flock {
         for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
@@ -306,19 +324,36 @@ pub async fn tick<D: Daemon>(
                 report.skipped += 1;
                 continue;
             };
-            // A sheep registered but never started has no log file yet, and
-            // that is normal rather than broken.
-            let Ok(metadata) = fs::metadata(base.live()) else {
-                report.skipped += 1;
-                continue;
+            let file = (protected.resolve(&base.dir), base.live_name());
+            let verdict = match verdicts.get(&file) {
+                Some(verdict) => *verdict,
+                None => {
+                    let verdict = match fs::metadata(base.live()) {
+                        // A sheep registered but never started has no log
+                        // file yet, and that is normal rather than broken.
+                        Err(_) => Verdict::Skip,
+                        Ok(metadata) => {
+                            match qualifies(&base, &metadata, &config, now, &mut listings) {
+                                // One directory this dog cannot read is
+                                // that log's problem, said so, and not a
+                                // reason to leave every other log alone.
+                                Listed::Unlistable(why) => {
+                                    report.unlistable.push(why);
+                                    Verdict::Leave
+                                }
+                                Listed::Verdict(verdict) => verdict,
+                            }
+                        }
+                    };
+                    verdicts.insert(file, verdict);
+                    verdict
+                }
             };
-            match qualifies(&base, &metadata, &config, now, &mut listings) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                // One directory this dog cannot read is that log's problem,
-                // said so, and not a reason to leave every other log alone.
-                Err(err) => {
-                    report.unlistable.push(err.to_string());
+            match verdict {
+                Verdict::Rotate => {}
+                Verdict::Leave => continue,
+                Verdict::Skip => {
+                    report.skipped += 1;
                     continue;
                 }
             }
@@ -346,11 +381,10 @@ pub async fn tick<D: Daemon>(
     // Bases whose sheep has reopened, so shep has stopped writing into what
     // was renamed. Only those are safe to compress or delete.
     let mut to_tidy: Vec<LogPath> = Vec::new();
-    // Where in `order` the loop stopped early, if it did: the sheep at this
-    // position and every one after it was not reopened this tick.
-    let mut not_reopened_from: Option<usize> = None;
+    // Positions in `order` of every sheep not reopened this tick.
+    let mut not_reopened: Vec<usize> = Vec::new();
 
-    'flock: for (position, name) in order.iter().enumerate() {
+    for (position, name) in order.iter().enumerate() {
         let mut rotated_any = false;
         let mut rotated_here: Vec<LogPath> = Vec::new();
         for base in &groups[name] {
@@ -377,15 +411,11 @@ pub async fn tick<D: Daemon>(
                     report.rotated += 1;
                     rotated_any = true;
                 }
-                Err(err) => {
-                    // Stop here rather than returning straight out: this
-                    // sheep may already have a renamed file behind it, and
-                    // the reopen below is what puts its writes back where
-                    // the operator looks for them. No further sheep is
-                    // rotated, but that one reopen runs.
-                    report.rename_failed = Some(err.to_string());
-                    break;
-                }
+                // A rename that fails leaves the live file where it was, so
+                // this log is simply not rotated this tick. That is this
+                // log's problem, said so, and no reason to leave the next
+                // one alone.
+                Err(err) => report.rename_failed.push(err.to_string()),
             }
         }
 
@@ -393,33 +423,32 @@ pub async fn tick<D: Daemon>(
             if let Err(err) = daemon.reopen(name).await {
                 // Rotating further sheep while the reopen path is broken
                 // turns one recoverable state into several confusing ones.
+                // This sheep and every one after it goes un-reopened.
                 report.reopen_failed = Some(format!("{name}: {err}"));
-                not_reopened_from = Some(position);
-                break 'flock;
+                not_reopened.extend(position..order.len());
+                break;
             }
             to_tidy.extend(rotated_here);
-        }
-        if report.rename_failed.is_some() {
-            // The ones after this sheep were never reached. This sheep was
-            // reopened only if it rotated something before the fault, or
-            // shares a path something before it rotated; a fault on its
-            // first base leaves it never reopened, and still writing into
-            // whatever an earlier sheep renamed out from under it.
-            not_reopened_from = Some(if rotated_any { position + 1 } else { position });
-            break 'flock;
+        } else {
+            // Nothing of this sheep's was renamed, so nothing needed a
+            // reopen. It can still share a path with a later sheep whose
+            // rename succeeds where this one's just failed, and it would
+            // then be writing into the renamed file through its old
+            // descriptor. Held back like a refused sheep, to be safe.
+            not_reopened.push(position);
         }
     }
 
-    // A sheep the loop never reached, or whose reopen was refused, is still
-    // writing into a renamed file through its old descriptor. Two sheep can
-    // share one log path, so a base an earlier sheep reopened may be that
+    // A sheep not reopened this tick is still writing into whatever was
+    // renamed out from under it, through its old descriptor. Two sheep can
+    // share one log path, so a base a reopened sheep rotated may be that
     // same file: compressing it would read it mid-append, and removing the
     // plain copy afterwards would delete what shep is writing to. Anything
     // such a sheep writes to is left for a later tick.
-    if let Some(from) = not_reopened_from {
+    if !not_reopened.is_empty() {
         let mut still_writing = FileSet::default();
-        for name in &order[from..] {
-            for base in &groups[name] {
+        for &position in &not_reopened {
+            for base in &groups[&order[position]] {
                 still_writing.insert(protected.resolve(&base.dir), base.live_name());
             }
         }
@@ -428,7 +457,7 @@ pub async fn tick<D: Daemon>(
         });
     }
 
-    tidy_all(&to_tidy, &config, &protected, &mut report, stop).await?;
+    tidy_all(&to_tidy, &config, &protected, &mut report, stop).await;
     Ok((config, report))
 }
 
@@ -448,16 +477,20 @@ pub async fn tick<D: Daemon>(
 /// the plain file is still there, since it is removed only after the `.gz`
 /// is complete and synced. Whatever was already counted stays counted; it
 /// describes work that was done.
+///
+/// A base whose compression or deletion fails is reported in
+/// [`Report::tidy_failed`] and the next base is still tidied: the fault is
+/// that generation's, and the generation is left as it was.
 async fn tidy_all(
     bases: &[LogPath],
     config: &Config,
     protected: &Arc<FileSet>,
     report: &mut Report,
     stop: &mut Stop,
-) -> Result<(), Error> {
+) {
     for base in bases {
         if stop.requested() {
-            return Ok(());
+            return;
         }
         let gzip = tokio::task::spawn_blocking({
             let (base, config, protected) = (base.clone(), config.clone(), Arc::clone(protected));
@@ -469,10 +502,14 @@ async fn tidy_all(
             // in the same instant must not throw them away.
             biased;
             joined = gzip => joined,
-            () = stop.wait() => return Ok(()),
+            () = stop.wait() => return,
         };
         let tidied = match joined {
-            Ok(tidied) => tidied?,
+            Ok(Ok(tidied)) => tidied,
+            Ok(Err(err)) => {
+                report.tidy_failed.push(err.to_string());
+                continue;
+            }
             Err(join) => match join.try_into_panic() {
                 // A panic in tidy is a bug, and it is re-raised here so the
                 // process fails the way it would have with tidy in place.
@@ -488,7 +525,24 @@ async fn tidy_all(
         report.deleted += tidied.deleted;
         report.skipped_protected += tidied.skipped_protected;
     }
-    Ok(())
+}
+
+/// What one tick decided about one log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Grown or aged past what the config allows.
+    Rotate,
+    /// Not yet.
+    Leave,
+    /// No log file to look at: a sheep registered but never started.
+    Skip,
+}
+
+/// [`qualifies`]'s answer: a verdict, or the one time a directory refused to
+/// be listed, with the reason.
+enum Listed {
+    Verdict(Verdict),
+    Unlistable(String),
 }
 
 /// Whether a log has grown or aged past what `config` allows.
@@ -505,35 +559,46 @@ async fn tidy_all(
 /// write. Not from the last write first: an mtime can be older than the
 /// rotation it followed, after a clock stepped back or a `touch`, and that
 /// would rotate a log that was rotated an hour ago. The listing the age is
-/// read from is taken once per directory per tick.
-///
-/// # Errors
-/// [`Error::Io`] if `max_age` is set, the log is under `max_size`, and its
-/// directory cannot be listed.
+/// read from is taken once per directory per tick, and a directory that
+/// refuses is asked once too: [`Listed::Unlistable`] the first time, with
+/// the reason, and [`Verdict::Leave`] for every later log in it.
 fn qualifies(
     base: &LogPath,
     metadata: &fs::Metadata,
     config: &Config,
     now: SystemTime,
-    listings: &mut BTreeMap<PathBuf, Vec<String>>,
-) -> Result<bool, Error> {
+    listings: &mut BTreeMap<PathBuf, Option<Vec<String>>>,
+) -> Listed {
     if metadata.len() == 0 {
-        return Ok(false);
+        return Listed::Verdict(Verdict::Leave);
     }
     if metadata.len() >= config.max_size.bytes() {
-        return Ok(true);
+        return Listed::Verdict(Verdict::Rotate);
     }
     let Some(max_age) = config.max_age else {
-        return Ok(false);
+        return Listed::Verdict(Verdict::Leave);
     };
-    let names = match listings.entry(base.dir.clone()) {
-        Entry::Vacant(slot) => slot.insert(regular_files(&base.dir)?),
+    let listed = match listings.entry(base.dir.clone()) {
+        Entry::Vacant(slot) => match regular_files(&base.dir) {
+            Ok(names) => slot.insert(Some(names)),
+            Err(err) => {
+                slot.insert(None);
+                return Listed::Unlistable(err.to_string());
+            }
+        },
         Entry::Occupied(slot) => slot.into_mut(),
+    };
+    let Some(names) = listed else {
+        return Listed::Verdict(Verdict::Leave);
     };
     let since = last_rotation(names, base, config.naming)
         .or_else(|| metadata.created().ok())
         .or_else(|| metadata.modified().ok());
-    Ok(aged(since, now, max_age.as_duration()))
+    Listed::Verdict(if aged(since, now, max_age.as_duration()) {
+        Verdict::Rotate
+    } else {
+        Verdict::Leave
+    })
 }
 
 /// Whether `instant` is at least `max_age` before `now`.
@@ -1059,7 +1124,7 @@ mod tests {
 
         let why = report
             .rename_failed
-            .as_deref()
+            .first()
             .expect("the fault is in the report");
         assert!(why.contains("api-0-err.log"), "{why}");
         assert!(why.contains("no generation numbers left"), "{why}");
@@ -1070,7 +1135,7 @@ mod tests {
         );
         assert!(dir.path().join("api-0-out.log.1").exists());
         assert!(
-            report.summary().expect("a line").contains("rename failed"),
+            report.summary().expect("a line").contains("to rename"),
             "the fault reaches the summary line"
         );
     }
@@ -1247,18 +1312,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rename_fault_on_a_sheeps_first_base_keeps_its_shared_base_untouched() {
-        // beta's out log faults before its err log is reached, so beta is
-        // never reopened. beta's err log is alpha's out log, which alpha
-        // rotated and reopened: beta still writes into that generation, so
-        // it is not safe to tidy, however cleanly alpha reopened it.
+    async fn a_rename_fault_does_not_stop_the_sheeps_other_logs() {
+        // beta's out log faults. Its err log is alpha's out log, which alpha
+        // rotated: beta still reaches it, counts as rotated through it, and
+        // is reopened, so the shared log is safe to tidy after all.
         let dir = tempfile::tempdir().expect("tempdir");
         let shared = dir.path().join("shared.log");
         let betas_out = dir.path().join("beta-0-out.log");
         fs::write(&shared, "x".repeat(2048)).expect("seeded");
         fs::write(&betas_out, "x".repeat(2048)).expect("seeded");
-        let old = dir.path().join("shared.log.1");
-        fs::write(&old, "old\n").expect("seeded");
+        fs::write(dir.path().join("shared.log.1"), "old\n").expect("seeded");
         fs::write(dir.path().join("beta-0-out.log.4294967295"), "oldest").expect("seeded");
         let fake = Fake::new(
             "max_size = \"1K\"\nnaming = \"numeric\"\nkeep = 1\ncompress = false\n",
@@ -1270,17 +1333,24 @@ mod tests {
 
         let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
-        assert!(
-            report.rename_failed.is_some(),
+        assert_eq!(
+            report.rename_failed.len(),
+            1,
             "beta's out log could not rotate"
         );
         assert_eq!(
             *fake.reopened.borrow(),
-            vec!["alpha".to_owned()],
-            "beta never reopened"
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            "beta shares the rotated log, so it is reopened for it"
         );
-        assert_eq!(report.deleted, 0, "shared.log.2 is what beta writes into");
-        assert!(dir.path().join("shared.log.2").exists());
+        assert_eq!(
+            report.deleted, 1,
+            "both sheep reopened, so shared.log.2 went"
+        );
+        assert!(
+            betas_out.exists(),
+            "the log that could not rotate is where it was"
+        );
     }
 
     #[tokio::test]
@@ -1305,7 +1375,7 @@ mod tests {
             .await
             .expect("a rename fault is reported, not returned as an error");
 
-        assert!(report.rename_failed.is_some());
+        assert_eq!(report.rename_failed.len(), 1);
         assert_eq!(*fake.reopened.borrow(), vec!["api".to_owned()]);
         assert!(
             dir.path().join("api-0-out.log.1").exists(),
@@ -1497,6 +1567,13 @@ mod tests {
         fs::write(&api, "small\n").expect("seeded");
         fs::write(&web, "x".repeat(2048)).expect("seeded");
         fs::set_permissions(&apis, fs::Permissions::from_mode(0o311)).expect("chmod");
+        if fs::read_dir(&apis).is_ok() {
+            // Root, or anything with CAP_DAC_OVERRIDE, is not refused by a
+            // mode bit, so the precondition this test is about is absent.
+            fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            eprintln!("skipped: this process can list a directory without its read bit");
+            return;
+        }
         let fake = Fake::new(
             "max_size = \"1K\"\nmax_age = \"168h\"\n",
             vec![
@@ -1517,6 +1594,105 @@ mod tests {
             report.unlistable
         );
         let line = report.summary().expect("a line");
-        assert!(line.contains("could not be listed"), "{line}");
+        assert!(line.contains("to list a log directory"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_rename_fault_on_one_sheep_does_not_stop_the_next() {
+        // api's directory has run out of generation numbers. That is api's
+        // problem, reported as such; web, in its own directory and over
+        // max_size, still rotates on the same tick.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let apis = dir.path().join("api");
+        fs::create_dir(&apis).expect("created");
+        let api = apis.join("api-0-out.log");
+        let web = dir.path().join("web-0-out.log");
+        fs::write(&api, "x".repeat(2048)).expect("seeded");
+        fs::write(&web, "x".repeat(2048)).expect("seeded");
+        fs::write(apis.join("api-0-out.log.4294967295"), "oldest").expect("seeded");
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\n",
+            vec![
+                sheep("api", Some(&api), None),
+                sheep("web", Some(&web), None),
+            ],
+        );
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rename_failed.len(), 1, "{:?}", report.rename_failed);
+        assert_eq!(report.rotated, 1, "web rotated regardless");
+        assert_eq!(*fake.reopened.borrow(), vec!["web".to_owned()]);
+        assert!(api.exists(), "api's live log is where it was");
+    }
+
+    #[tokio::test]
+    async fn a_tidy_fault_is_reported_and_the_tick_goes_on() {
+        // The .gz that compressing the older generation would create is a
+        // directory, so File::create fails. That is that generation's
+        // problem, on the summary line; the rotation and the reopen stand,
+        // and the report comes back whole.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("web-0-out.log");
+        fs::write(&out, "x".repeat(2048)).expect("seeded");
+        let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        fs::write(&older, "older\n").expect("seeded");
+        fs::create_dir(dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz")).expect("blocker");
+        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
+
+        let (_config, report) = run(&fake, SystemTime::now())
+            .await
+            .expect("a tidy fault is reported, not returned");
+
+        assert_eq!(report.rotated, 1);
+        assert_eq!(*fake.reopened.borrow(), vec!["web".to_owned()]);
+        assert_eq!(report.tidy_failed.len(), 1, "{:?}", report.tidy_failed);
+        assert!(
+            report.tidy_failed[0].contains("15-04-01.log.gz"),
+            "{:?}",
+            report.tidy_failed
+        );
+        assert!(
+            older.exists(),
+            "the generation that could not be compressed is still plain"
+        );
+        let line = report.summary().expect("a line");
+        assert!(line.contains("to compress or delete"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_directory_is_listed_once_and_reported_once() {
+        // merge_logs points out_file and err_file at one path, and a second
+        // sheep logs in the same directory. One directory, one attempt, one
+        // line on the summary.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let apis = dir.path().join("api");
+        fs::create_dir(&apis).expect("created");
+        let api = apis.join("api-0-out.log");
+        let other = apis.join("api-1-out.log");
+        fs::write(&api, "small\n").expect("seeded");
+        fs::write(&other, "small\n").expect("seeded");
+        fs::set_permissions(&apis, fs::Permissions::from_mode(0o311)).expect("chmod");
+        if fs::read_dir(&apis).is_ok() {
+            fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            eprintln!("skipped: this process can list a directory without its read bit");
+            return;
+        }
+        let fake = Fake::new(
+            "max_size = \"1K\"\nmax_age = \"168h\"\n",
+            vec![
+                sheep("api", Some(&api), Some(&api)),
+                sheep("api-1", Some(&other), None),
+            ],
+        );
+
+        let outcome = run(&fake, SystemTime::now()).await;
+        fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let (_config, report) = outcome.expect("ticked");
+
+        assert_eq!(report.unlistable.len(), 1, "{:?}", report.unlistable);
+        assert_eq!(report.rotated, 0);
     }
 }

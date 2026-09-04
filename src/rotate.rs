@@ -115,7 +115,10 @@ pub fn generations_from(names: &[String], base: &LogPath, naming: Naming) -> Vec
 /// asked, and this dog never compresses it, so no gzip of its own has
 /// rewritten the mtime. An operator's `gzip -k` on it leaves a `.gz` twin
 /// with the same order and the operator's timestamp, so among twins the
-/// plain file is the one asked.
+/// plain file is the one asked. A newest generation an operator deleted,
+/// or compressed without keeping the plain file, shifts the reading: to
+/// the rotation before last in the first case, to the operator's gzip in
+/// the second. Both are the operator's, and neither deletes anything.
 pub fn last_rotation(names: &[String], base: &LogPath, naming: Naming) -> Option<SystemTime> {
     let found = generations_from(names, base, naming);
     let newest = found.first()?;

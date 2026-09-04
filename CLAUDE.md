@@ -23,6 +23,7 @@ A log-rotation dog for shep. One binary, one poll loop, no library target.
 - `src/tick.rs` is the only module that talks to the daemon. `src/prune.rs` is the only one that deletes a file. `src/naming.rs` is the only place a generation name is built or recognised, and a false match there deletes an operator's data.
 - Directory comparisons go through `file_set::ResolvedDir`, never `PathBuf` equality: `..` and a symlinked directory read as different files otherwise. Both guards and the renamed set share one `FileSet`.
 - `stop::Stop` carries ctrl-c. `tick` consults it only from its tidy loop, where each gzip runs on a blocking thread; the renames and reopens always run to completion. A tick interrupted between a rename and its reopen would leave shep writing into a file with the wrong name, so do not add a stop check there.
+- A fault on disk never fails a tick. A rename, a compression, a deletion or a directory listing that fails is that log's problem, reported on the summary line, and the next log is still handled. Only the daemon stops a tick: a config it cannot read, a request it cannot make, a reopen it refuses.
 - `max_age` counts from the last rotation, read off the newest generation (`rotate::last_rotation`), then from the file's birth time, then from its last write. Never the last write first: an mtime can predate the rotation it followed.
 - `shep-client` comes by version from crates.io. The floor is 0.1.23, the first release with `connect_as_dog`. The lockfile pins the newest published and is refreshed deliberately.
 
