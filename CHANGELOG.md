@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-04
+
+### Added
+
+- Gzip on a blocking thread, and let ctrl-c interrupt it
+- Count max_age from the last rotation, not the last write
+
+### Changed
+
+- One Error::io_at for the eleven map_err closures naming a path
+- Name the generation listing's item instead of a three-tuple
+- Take the infix by reference
+
+### Fixed
+
+- One file under two spellings is one rotation, and one resolved index for every guard
+- Resolve a base the way the protected set was, not the way the disk reads now
+- Tidy what every sheep reopened, even when a later one stops the tick
+- Close what the review of the reopen, offload and max_age changes found
+- A fault on disk is one log's problem, never the tick's
+- Hold back the file a rename failed on, and let one bad generation not stop a prune
+- A compression that fails after creating its target leaves a twin, not an orphan
+- Refuse a symlink where an archive would be written
+- Create the archive exclusively, so a link cannot be swapped in between check and create
+
+
 ## [0.1.5] - 2026-09-03
 
 ### Fixed
