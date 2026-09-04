@@ -515,7 +515,8 @@ fn named(response: &Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shep_client::shep_core::protocol::ProcessInfo;
+    use shep_client::shep_core::status::ProcStatus;
+    use std::cell::RefCell;
 
     /// `Live`'s `Debug` is written rather than derived so a socket path under
     /// somebody's home directory cannot reach a log or a bug report. Proven
@@ -545,16 +546,24 @@ mod tests {
             "the socket path leaked: {shown}"
         );
     }
-    use shep_client::shep_core::status::ProcStatus;
-    use std::cell::RefCell;
-    use std::fs;
-
     /// A daemon that answers from a script and records what it was asked.
     struct Fake {
         config: String,
         flock: Vec<ProcessInfo>,
         reopen_fails: Option<String>,
         reopened: RefCell<Vec<String>>,
+    }
+
+    impl Fake {
+        /// A daemon serving `config` and `flock` that grants every reopen.
+        fn new(config: &str, flock: Vec<ProcessInfo>) -> Self {
+            Self {
+                config: config.to_owned(),
+                flock,
+                reopen_fails: None,
+                reopened: RefCell::new(Vec::new()),
+            }
+        }
     }
 
     impl Daemon for Fake {
@@ -587,19 +596,20 @@ mod tests {
             .build()
     }
 
+    /// A `now` a year ahead of the clock, so a file written moments ago is
+    /// unambiguously older than any `max_age` a test sets.
+    fn a_year_on() -> SystemTime {
+        SystemTime::now() + core::time::Duration::from_secs(31_536_000)
+    }
+
     #[tokio::test]
     async fn a_file_over_max_size_is_rotated_and_its_sheep_reopened() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "x".repeat(2048)).expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\n".into(),
-            flock: vec![sheep("web", Some(&out), None)],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -613,14 +623,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "small\n").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1M\"\n".into(),
-            flock: vec![sheep("web", Some(&out), None)],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        let fake = Fake::new("max_size = \"1M\"\n", vec![sheep("web", Some(&out), None)]);
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -635,18 +640,16 @@ mod tests {
     #[tokio::test]
     async fn a_sheep_with_no_log_file_yet_is_skipped_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let fake = Fake {
-            config: String::new(),
-            flock: vec![sheep(
+        let fake = Fake::new(
+            "",
+            vec![sheep(
                 "web",
                 Some(&dir.path().join("never-started.log")),
                 None,
             )],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("a missing log file is ordinary");
 
@@ -662,16 +665,17 @@ mod tests {
         fs::write(&first, "x".repeat(2048)).expect("seeded");
         fs::write(&second, "x".repeat(2048)).expect("seeded");
         let fake = Fake {
-            config: "max_size = \"1K\"\n".into(),
-            flock: vec![
-                sheep("api", Some(&first), None),
-                sheep("web", Some(&second), None),
-            ],
             reopen_fails: Some("api".into()),
-            reopened: RefCell::new(Vec::new()),
+            ..Fake::new(
+                "max_size = \"1K\"\n",
+                vec![
+                    sheep("api", Some(&first), None),
+                    sheep("web", Some(&second), None),
+                ],
+            )
         };
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("a refused reopen is reported, not returned as an error");
 
@@ -692,17 +696,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let shared = dir.path().join("web-out.log");
         fs::write(&shared, "x".repeat(2048)).expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\n".into(),
-            flock: vec![
+        let fake = Fake::new(
+            "max_size = \"1K\"\n",
+            vec![
                 sheep("web-0", Some(&shared), None),
                 sheep("web-1", Some(&shared), None),
             ],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -717,16 +719,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "tiny\n").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1G\"\nmax_age = \"1s\"\n".into(),
-            flock: vec![sheep("web", Some(&out), None)],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
-        // `now` a year on, so the file's real mtime is unambiguously older.
-        let far_future = std::time::SystemTime::now() + core::time::Duration::from_secs(31_536_000);
-
-        let (_config, report) = tick(&fake, "log-rotate", far_future).await.expect("ticked");
+        let fake = Fake::new(
+            "max_size = \"1G\"\nmax_age = \"1s\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
+        let (_config, report) = tick(&fake, "log-rotate", a_year_on())
+            .await
+            .expect("ticked");
 
         assert_eq!(report.rotated, 1);
     }
@@ -736,14 +735,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "x".repeat(4096)).expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"10MB\"\n".into(),
-            flock: vec![sheep("web", Some(&out), None)],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        let fake = Fake::new(
+            "max_size = \"10MB\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
 
-        tick(&fake, "log-rotate", std::time::SystemTime::now())
+        tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect_err("10MB is not a spelling shep accepts");
 
@@ -768,17 +765,15 @@ mod tests {
         let live = dir.path().join("web.1");
         fs::write(&grown, "x".repeat(2048)).expect("seeded");
         fs::write(&live, "one's live log\n").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\nnaming = \"numeric\"\n".into(),
-            flock: vec![
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\n",
+            vec![
                 sheep("web", Some(&grown), None),
                 sheep("one", Some(&live), None),
             ],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -815,17 +810,15 @@ mod tests {
         let live = real.join("web.1");
         fs::write(&grown, "x".repeat(2048)).expect("seeded");
         fs::write(&live, "one's live log\n").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\nnaming = \"numeric\"\n".into(),
-            flock: vec![
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\n",
+            vec![
                 sheep("web", Some(&grown), None),
                 sheep("one", Some(&live), None),
             ],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -850,17 +843,15 @@ mod tests {
         let grown = dir.path().join("web");
         let claimed = dir.path().join("web.1");
         fs::write(&grown, "x".repeat(2048)).expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\nnaming = \"numeric\"\n".into(),
-            flock: vec![
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\n",
+            vec![
                 sheep("web", Some(&grown), None),
                 sheep("one", Some(&claimed), None),
             ],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("ticked");
 
@@ -883,14 +874,12 @@ mod tests {
         // The last generation number there is, so the shift has nowhere to
         // go and `rotate` refuses rather than wrapping.
         fs::write(dir.path().join("api-0-err.log.4294967295"), "oldest").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\nnaming = \"numeric\"\n".into(),
-            flock: vec![sheep("api", Some(&out), Some(&err))],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        let fake = Fake::new(
+            "max_size = \"1K\"\nnaming = \"numeric\"\n",
+            vec![sheep("api", Some(&out), Some(&err))],
+        );
 
-        let failure = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let failure = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect_err("no generation numbers left");
 
@@ -910,15 +899,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "").expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1G\"\nmax_age = \"1s\"\n".into(),
-            flock: vec![sheep("web", Some(&out), None)],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
-        let far_future = std::time::SystemTime::now() + core::time::Duration::from_secs(31_536_000);
-
-        let (_config, report) = tick(&fake, "log-rotate", far_future).await.expect("ticked");
+        let fake = Fake::new(
+            "max_size = \"1G\"\nmax_age = \"1s\"\n",
+            vec![sheep("web", Some(&out), None)],
+        );
+        let (_config, report) = tick(&fake, "log-rotate", a_year_on())
+            .await
+            .expect("ticked");
 
         assert_eq!(report.rotated, 0);
         assert!(out.exists());
@@ -963,17 +950,15 @@ mod tests {
         let through_link = link.join("web-out.log");
         let direct = real.join("web-out.log");
         fs::write(&direct, "x".repeat(2048)).expect("seeded");
-        let fake = Fake {
-            config: "max_size = \"1K\"\n".into(),
-            flock: vec![
+        let fake = Fake::new(
+            "max_size = \"1K\"\n",
+            vec![
                 sheep("web-0", Some(&through_link), None),
                 sheep("web-1", Some(&direct), None),
             ],
-            reopen_fails: None,
-            reopened: RefCell::new(Vec::new()),
-        };
+        );
 
-        let (_config, report) = tick(&fake, "log-rotate", std::time::SystemTime::now())
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now())
             .await
             .expect("one file under two spellings is one rotation, not an error");
 
