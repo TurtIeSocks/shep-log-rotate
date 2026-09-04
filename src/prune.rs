@@ -25,7 +25,7 @@ use crate::{
     config::Config,
     error::Error,
     naming::{LogPath, Order, with_gz},
-    rotate::generations,
+    rotate::{GenerationFile, generations},
 };
 
 /// What one pass of [`tidy`] did.
@@ -126,7 +126,12 @@ pub fn tidy(
     // arrive adjacent and a single running comparison is enough.
     let mut ours: Vec<Generation> = Vec::new();
     let mut current: Option<Order> = None;
-    for (path, order, compressed) in generations(base, config.naming)? {
+    for GenerationFile {
+        path,
+        order,
+        compressed,
+    } in generations(base, config.naming)?
+    {
         if is_protected(&untouchable, &path) {
             tidied.skipped_protected += 1;
             continue;

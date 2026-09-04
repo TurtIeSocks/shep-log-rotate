@@ -12,12 +12,28 @@ use crate::{
     naming::{LogPath, Order, dated_name, match_generation, numeric_name, stamp_utc, with_gz},
 };
 
+/// One file on disk that [`generations`] recognised as a generation of its
+/// base.
+///
+/// A file rather than a generation: a generation an earlier crash left
+/// half-compressed is two of these, one plain and one `.gz`, carrying the
+/// same [`Order`]. Folding those into one is `prune::tidy`'s job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationFile {
+    /// Where the file is, always `base.dir` joined with its own name.
+    pub path: PathBuf,
+    /// Where the generation sits in its scheme's ordering.
+    pub order: Order,
+    /// Whether this is the `.gz` half rather than the plain one.
+    pub compressed: bool,
+}
+
 /// Every generation this dog created for `base`, newest first.
 ///
 /// A missing log directory is not an error: a sheep that is registered but
 /// never started has no log file yet, so this returns an empty list rather
 /// than failing.
-pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<(PathBuf, Order, bool)>, Error> {
+pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<GenerationFile>, Error> {
     let entries = match fs::read_dir(&base.dir) {
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         listing => listing.map_err(Error::io_at(&base.dir))?,
@@ -58,10 +74,14 @@ pub fn generations(base: &LogPath, naming: Naming) -> Result<Vec<(PathBuf, Order
         let Some((order, compressed)) = match_generation(base, naming, &file_name) else {
             continue;
         };
-        found.push((base.dir.join(&file_name), order, compressed));
+        found.push(GenerationFile {
+            path: base.dir.join(&file_name),
+            order,
+            compressed,
+        });
     }
 
-    found.sort_by(|a, b| Order::newest_first(&a.1, &b.1));
+    found.sort_by(|a, b| Order::newest_first(&a.order, &b.order));
     Ok(found)
 }
 
@@ -126,7 +146,12 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
     let mut found = generations(base, Naming::Numeric)?;
     found.reverse();
 
-    for (path, order, compressed) in found {
+    for GenerationFile {
+        path,
+        order,
+        compressed,
+    } in found
+    {
         let Order::Numeric { n } = order else {
             unreachable!("generations(_, Naming::Numeric) only ever returns Order::Numeric")
         };
@@ -378,8 +403,8 @@ mod tests {
             2,
             "the live file and the decoy are not generations"
         );
-        assert!(found[0].0.to_str().expect("utf8").contains("15-04-06"));
-        assert!(found[1].0.to_str().expect("utf8").contains("15-04-05"));
+        assert!(found[0].path.to_str().expect("utf8").contains("15-04-06"));
+        assert!(found[1].path.to_str().expect("utf8").contains("15-04-05"));
     }
 
     #[test]
