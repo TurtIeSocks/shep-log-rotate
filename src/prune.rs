@@ -176,6 +176,17 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
             // how the interrupted compression finishes.
             if let Err(err) = compress(&plain, &target) {
                 tidied.faults.push(err.to_string());
+                // `compress` creates its target before it writes a byte,
+                // so a fault after that, a full disk say, leaves a partial
+                // `.gz` beside the plain file. The generation wears both
+                // now: they go together if it is pruned below, and the next
+                // pass compresses the plain half over the partial one. Left
+                // unrecorded, the prune would remove the plain file alone
+                // and the truncated archive would stand in for the
+                // generation for good.
+                if target.is_file() {
+                    generation.gz = Some(target);
+                }
                 continue;
             }
             generation.plain = None;
