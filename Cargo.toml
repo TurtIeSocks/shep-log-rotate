@@ -50,3 +50,34 @@ shep-client = { version = "0.1.23", features = ["test-support"] }
 [[test]]
 name = "integration"
 required-features = ["integration"]
+
+# The same profile settings shep itself carries, for the same reasons.
+#
+# Debug info dominates a debug build, and a dependency's is never what is
+# being debugged. Measured 2026-09-03, clean `cargo test --no-run`:
+#
+#   target/debug   562 MiB   before
+#   target/debug   348 MiB   after
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Size, not speed. shep measured thin LTO with one codegen unit at a quarter
+# off its binary and nothing measurable off its runtime, and this crate's
+# only hot loop is flate2's, which a 64 MiB gzip run timed the same either
+# way on 2026-09-03: 190 to 255 MiB/s in both builds, the spread all noise.
+# Fat LTO buys another megabyte for another half minute of build, which
+# `cargo install` pays on every upgrade. Measured the same day, clean
+# `cargo build --release`:
+#
+#   shep-log-rotate   2,515,168 bytes   before
+#   shep-log-rotate   2,012,672 bytes   after
+#
+# Not `strip`, and not `panic = "abort"`, for shep's reasons: symbols are
+# what a profiler names frames with, and `shep-client` re-raises a panicked
+# task with `resume_unwind`, which needs a runtime that unwinds.
+[profile.release]
+lto = "thin"
+codegen-units = 1
