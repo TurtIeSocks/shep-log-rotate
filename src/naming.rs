@@ -88,15 +88,15 @@ impl LogPath {
     /// The live log's file name alone: `web-0-out.log` for
     /// `/var/log/web-0-out.log`.
     pub fn live_name(&self) -> String {
-        self.file_name(String::new())
+        self.file_name("")
     }
 
     /// The file name for this base, with `infix` spliced in before the
     /// extension. An empty `infix` rebuilds the live name.
-    fn file_name(&self, infix: String) -> String {
+    fn file_name(&self, infix: &str) -> String {
         let mut name = String::with_capacity(self.stem.len() + infix.len() + 8);
         name.push_str(&self.stem);
-        name.push_str(&infix);
+        name.push_str(infix);
         if let Some(ext) = &self.ext {
             name.push('.');
             name.push_str(ext);
@@ -213,7 +213,7 @@ pub fn dated_name(base: &LogPath, stamp: &str, counter: u32) -> PathBuf {
     } else {
         format!(".{stamp}.{counter}")
     };
-    base.dir.join(base.file_name(infix))
+    base.dir.join(base.file_name(&infix))
 }
 
 /// Build the numeric name for a generation: `{stem}.{ext}.{n}`.
@@ -228,7 +228,7 @@ pub fn dated_name(base: &LogPath, stamp: &str, counter: u32) -> PathBuf {
 #[track_caller]
 pub fn numeric_name(base: &LogPath, n: u32) -> PathBuf {
     debug_assert!(n >= 1, "numeric generations start at 1, not {n}");
-    let mut name = base.file_name(String::new());
+    let mut name = base.live_name();
     name.push('.');
     name.push_str(&n.to_string());
     base.dir.join(name)
@@ -302,7 +302,7 @@ fn match_dated(base: &LogPath, rest: &str) -> Option<Order> {
 
 /// Match `rest` (already `.gz`-stripped) as `{stem}.{ext}.{n}`.
 fn match_numeric(base: &LogPath, rest: &str) -> Option<Order> {
-    let live = base.file_name(String::new());
+    let live = base.live_name();
     let digits = rest.strip_prefix(&live)?.strip_prefix('.')?;
     Some(Order::Numeric {
         n: parse_index(digits.as_bytes())?,
