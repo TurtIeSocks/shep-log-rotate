@@ -7,7 +7,8 @@ A log-rotation dog for shep. One binary, one poll loop, no library target.
 - `cargo test --locked` is the test shape. There is no lib target, so `cargo test --lib` errors out with "no library targets found".
 - The four lint gates CI runs, all required: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features`, and `cargo +1.88 check --all-targets --all-features --locked`.
 - `SHEP_BIN=/path/to/shep cargo test --features integration --locked` drives a real shepherd in a temporary `$SHEP_HOME`. Off by default because a fresh clone has no shep binary. A plain `cargo test` runs a test named `heads_up_the_real_shepherd_tier_is_not_running` whose only job is to say so.
-- `cargo llvm-cov --locked --summary-only` for coverage. The unit tier sits at 90% of lines; `main.rs` is the low file because the poll loop needs a daemon.
+- `cargo llvm-cov --locked --summary-only` for coverage. The unit tier sits above 92% of lines; `main.rs` is the low file because the poll loop needs a daemon.
+- The integration tier boots five shepherds in parallel and races shell loops, so it is load sensitive. A test that fails only in the full run and passes alone is a timing race in the test, not in the dog. Measure it: `--test integration <name>` ten times alone, then the full tier ten times, before blaming a change.
 
 ## Rules the tests already enforce
 
