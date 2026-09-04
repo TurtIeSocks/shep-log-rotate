@@ -14,7 +14,6 @@
 
 use std::{
     collections::BTreeSet,
-    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -24,12 +23,19 @@ use flate2::{Compression, write::GzEncoder};
 use crate::{
     config::Config,
     error::Error,
+    file_set::FileSet,
     naming::{LogPath, Order, with_gz},
-    rotate::generations,
+    rotate::{GenerationFile, generations},
 };
 
 /// What one pass of [`tidy`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `Debug` is derived, deliberately, on the reasoning [`Error`] gives for
+/// its own: every message in `faults` is printed for the operator on the
+/// tick's summary line, and the path in it is the diagnostic. Redacting it
+/// from `Debug` would hide from a maintainer what a user is shown anyway.
+/// Pinned by `debug_carries_the_fault_paths`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tidied {
     /// Files gzipped on this pass. A generation is compressed at most once,
     /// so this is also the number of generations compressed.
@@ -56,6 +62,11 @@ pub struct Tidied {
     /// them, and the only party that knows which files are being written to
     /// is the shepherd.
     pub skipped_protected: usize,
+    /// Compressions and deletions that failed, one message each. A fault is
+    /// one generation's: the generation is left as it was, and the pass goes
+    /// on to the next one and still prunes. A generation that will not
+    /// compress and is past `keep` is still deleted, plain.
+    pub faults: Vec<String>,
 }
 
 /// One rotated generation, and the file or files on disk carrying it.
@@ -94,24 +105,26 @@ impl Generation {
 /// together when it is pruned, and the next pass with compression on folds
 /// it back down to one file.
 ///
+/// A compression or a deletion that fails is one generation's fault,
+/// recorded in [`Tidied::faults`], and the pass goes on: the next generation
+/// is still compressed and the prune still runs. One generation that will
+/// not compress, a `.gz` target that is a directory say, must not hold every
+/// older generation of the base past `keep` for good.
+///
 /// No member of `protected` is ever compressed or deleted, whatever its name
 /// says, and none of them counts against `keep` either: a live log that
 /// happens to look like a generation is not one of this dog's, so sparing it
 /// must not cost a real generation its place. Members are matched by file
-/// name within `base.dir`, with the directory resolved first, so a `..` in
+/// name within `base.dir`, which [`FileSet`] resolves first, so a `..` in
 /// the caller's spelling or a symlinked log directory cannot quietly turn
 /// the guard off.
 ///
 /// # Errors
-/// [`Error::Io`], naming the path, if the log directory cannot be listed or
-/// if a generation cannot be read, compressed or removed.
-pub fn tidy(
-    base: &LogPath,
-    config: &Config,
-    protected: &BTreeSet<PathBuf>,
-) -> Result<Tidied, Error> {
+/// [`Error::Io`], naming the directory, if the log directory cannot be
+/// listed. Nothing can be done for a base whose generations cannot be seen.
+pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidied, Error> {
     let mut tidied = Tidied::default();
-    let untouchable = protected_names(&base.dir, protected);
+    let untouchable = protected.names_in(&protected.resolve(&base.dir));
 
     // Two things happen here, and both are about slots.
     //
@@ -126,8 +139,13 @@ pub fn tidy(
     // arrive adjacent and a single running comparison is enough.
     let mut ours: Vec<Generation> = Vec::new();
     let mut current: Option<Order> = None;
-    for (path, order, compressed) in generations(base, config.naming)? {
-        if is_protected(&untouchable, &path) {
+    for GenerationFile {
+        path,
+        order,
+        compressed,
+    } in generations(base, config.naming)?
+    {
+        if is_protected(untouchable, &path) {
             tidied.skipped_protected += 1;
             continue;
         }
@@ -155,14 +173,28 @@ pub fn tidy(
             // The target is a file this pass is about to create or truncate.
             // Truncating a live log is the same harm as deleting one, so it
             // gets the same refusal.
-            if is_protected(&untouchable, &target) {
+            if is_protected(untouchable, &target) {
                 tidied.skipped_protected += 1;
                 continue;
             }
             // A `.gz` already sitting there is the half-written leftover of
-            // the crash that made this generation a twin. Overwriting it is
+            // the crash that made this generation a twin. Replacing it is
             // how the interrupted compression finishes.
-            compress(&plain, &target)?;
+            if let Err(err) = compress(&plain, &target) {
+                tidied.faults.push(err.to_string());
+                // `compress` creates its target before it writes a byte,
+                // so a fault after that, a full disk say, leaves a partial
+                // `.gz` beside the plain file. The generation wears both
+                // now: they go together if it is pruned below, and the next
+                // pass compresses the plain half over the partial one. Left
+                // unrecorded, the prune would remove the plain file alone
+                // and the truncated archive would stand in for the
+                // generation for good.
+                if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_file()) {
+                    generation.gz = Some(target);
+                }
+                continue;
+            }
             generation.plain = None;
             generation.gz = Some(target);
             tidied.compressed += 1;
@@ -174,96 +206,75 @@ pub fn tidy(
     // time, and one generation is one slot.
     for generation in ours.iter().skip(config.keep) {
         for path in generation.files() {
-            remove(path)?;
-            tidied.deleted += 1;
+            match remove(path) {
+                Ok(()) => tidied.deleted += 1,
+                Err(err) => tidied.faults.push(err.to_string()),
+            }
         }
     }
 
     Ok(tidied)
 }
 
-/// The file names in `protected` that name a file in `dir`.
-///
-/// Comparing whole [`PathBuf`]s is not enough. Path equality normalises `.`
-/// away but not `..`, and it knows nothing about symlinks, so
-/// `/var/log/sub/../web.1` and a `/var/log` that is itself a link both slip
-/// past a whole-path comparison with nothing said about it. A guard that
-/// silently does nothing is worse than no guard at all, because the caller
-/// believes the file is safe. Resolving the directory once and comparing
-/// file names within it closes both.
-///
-/// This is defence in depth rather than the only line of it: the caller
-/// normalises when it builds the set. A path that will not resolve is
-/// compared as it was written, because failing to resolve something is not a
-/// reason to stop protecting it.
-fn protected_names(dir: &Path, protected: &BTreeSet<PathBuf>) -> BTreeSet<OsString> {
-    let resolved = resolve(dir);
-    let mut names = BTreeSet::new();
-    for path in protected {
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        // The spellings usually agree already, and two comparisons are free
-        // next to a `canonicalize` for every member on every call.
-        if parent == dir || parent == resolved.as_path() || resolve(parent) == resolved {
-            names.insert(name.to_os_string());
-        }
-    }
-    names
-}
-
 /// Whether `path` names one of the caller's live logs.
 ///
 /// By file name, which is sound only because every path this module acts on
-/// was built from `base.dir` and [`protected_names`] kept only the members
-/// that live there.
-fn is_protected(names: &BTreeSet<OsString>, path: &Path) -> bool {
-    path.file_name().is_some_and(|name| names.contains(name))
+/// was built from `base.dir`, and `names` is what the caller's [`FileSet`]
+/// holds for that same directory.
+fn is_protected(names: &BTreeSet<String>, path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| names.contains(name))
 }
 
-/// `canonicalize`, falling back to the path as written when it will not
-/// resolve.
-///
-/// `pub(crate)` because the `tick` module asks the same question about
-/// the same directories, on the rename half of the same guard. Two answers
-/// to "is this the directory I think it is" is one more than a guard can
-/// have: the rename guard missing a spelling this one catches means the
-/// rename happens and the protection afterwards has nothing left to
-/// protect.
-///
-/// There is deliberately no special case for the empty path here. Every
-/// directory that reaches this function came through [`LogPath::split`],
-/// which already reads a missing directory component as `.`, and a second
-/// copy of that rule down here would be a copy that can go missing from a
-/// third place.
-pub(crate) fn resolve(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Create `target` truncated and already at `permissions`, and hand back the
+/// Create `target`, empty and already at `permissions`, and hand back the
 /// open handle.
 ///
-/// The two steps live in one function because they have to stay adjacent.
-/// `File::create` opens at `0o666 & !umask`, so a chmod that drifts away
-/// from it, down to the end of a longer function say, leaves a log that is
-/// private for a reason readable by anyone for the entire length of the
-/// gzip. On a large log that is not a short window, and no test can see it:
-/// what a test can check is that the mode is right at the end, which is true
-/// either way. Keeping the pair together is the guard.
+/// The create is exclusive: `O_EXCL` never follows a symlink, so this is
+/// the one create that cannot be pointed somewhere else by a link planted
+/// at the target's name. Nothing this dog writes is a symlink, so one found
+/// there is somebody else's and is refused. A regular file found there is
+/// the half-written leftover of the crash that made this generation a
+/// twin, and finishing the compression means replacing it: it is removed
+/// and the create runs again, as exclusive as the first, so a link planted
+/// in between is refused too. A check before an ordinary create would
+/// leave that window open.
 ///
+/// The permissions go on the handle rather than the path, and in the same
+/// function as the create, because the two have to stay adjacent. A create
+/// opens at `0o666 & !umask`, so a chmod that drifts away from it, down to
+/// the end of a longer function say, leaves a log that is private for a
+/// reason readable by anyone for the entire length of the gzip. On a large
+/// log that is not a short window, and no test can see it: what a test can
+/// check is that the mode is right at the end, which is true either way.
 /// Only the empty file is ever at the creation mode, and the handle keeps
-/// its write access across the change, so a read-only mode still works here.
+/// its write access across the change, so a read-only mode still works.
 fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
-    let file = fs::File::create(target).map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(target, permissions).map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
+    let file = match create_new(target) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let found = fs::symlink_metadata(target).map_err(Error::io_at(target))?;
+            if found.file_type().is_symlink() {
+                return Err(Error::io_at(target)(io::Error::other(
+                    "is a symlink, and this dog does not write through one",
+                )));
+            }
+            remove(target)?;
+            create_new(target).map_err(Error::io_at(target))?
+        }
+        Err(err) => return Err(Error::io_at(target)(err)),
+    };
+    file.set_permissions(permissions)
+        .map_err(Error::io_at(target))?;
     Ok(file)
+}
+
+/// Create `target` for writing, failing if anything is at that name.
+fn create_new(target: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
 }
 
 /// gzip `path` into `target`, then remove `path`.
@@ -282,33 +293,15 @@ fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Resul
 /// Permissions come across with the bytes, and ahead of them. A log written
 /// 0600 because it carries something private stays 0600 once compressed.
 fn compress(path: &Path, target: &Path) -> Result<(), Error> {
-    let mut source = fs::File::open(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let permissions = source
-        .metadata()
-        .map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .permissions();
+    let mut source = fs::File::open(path).map_err(Error::io_at(path))?;
+    let permissions = source.metadata().map_err(Error::io_at(path))?.permissions();
 
     let sink = create_with_permissions(target, permissions)?;
 
     let mut encoder = GzEncoder::new(sink, Compression::default());
-    io::copy(&mut source, &mut encoder).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let sink = encoder.finish().map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
-    sink.sync_all().map_err(|source| Error::Io {
-        path: target.to_path_buf(),
-        source,
-    })?;
+    io::copy(&mut source, &mut encoder).map_err(Error::io_at(path))?;
+    let sink = encoder.finish().map_err(Error::io_at(target))?;
+    sink.sync_all().map_err(Error::io_at(target))?;
 
     remove(path)
 }
@@ -317,16 +310,16 @@ fn compress(path: &Path, target: &Path) -> Result<(), Error> {
 ///
 /// The one line in this binary that destroys data.
 fn remove(path: &Path) -> Result<(), Error> {
-    fs::remove_file(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    fs::remove_file(path).map_err(Error::io_at(path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Naming};
+    use crate::{
+        config::{Config, Naming},
+        test_support::{live_log, seed},
+    };
     use std::fs;
 
     fn config(naming: Naming, keep: usize, compress: bool) -> Config {
@@ -342,17 +335,16 @@ mod tests {
     fn the_newest_generation_stays_plain_so_it_is_greppable() {
         let dir = tempfile::tempdir().expect("tempdir");
         for stamp in ["15-04-05", "15-04-06", "15-04-07"] {
-            fs::write(
-                dir.path().join(format!("web-0-out.2026-08-20T{stamp}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T{stamp}.log"),
                 "body\n",
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 2);
         assert!(
@@ -383,16 +375,11 @@ mod tests {
     fn compression_round_trips_the_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = "line one\nline two\nline three\n";
-        fs::write(dir.path().join("web-0-out.2026-08-20T15-04-05.log"), body).expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-06.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-05.log", body);
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         let gz =
             fs::File::open(dir.path().join("web-0-out.2026-08-20T15-04-05.log.gz")).expect("open");
@@ -409,18 +396,16 @@ mod tests {
     fn keep_bounds_the_generations_and_deletes_the_oldest() {
         let dir = tempfile::tempdir().expect("tempdir");
         for second in 1..=6 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 format!("gen{second}\n"),
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 2, false), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 2, false), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.deleted, 4);
         assert!(
@@ -448,12 +433,11 @@ mod tests {
     fn pruning_never_deletes_a_file_this_dog_did_not_create() {
         let dir = tempfile::tempdir().expect("tempdir");
         for second in 1..=6 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 "ours\n",
-            )
-            .expect("seeded");
+            );
         }
         // Every one of these is a plausible near miss. None was written here.
         let decoys = [
@@ -465,12 +449,11 @@ mod tests {
             "important.log",
         ];
         for decoy in decoys {
-            fs::write(dir.path().join(decoy), "not ours\n").expect("seeded");
+            seed(dir.path(), decoy, "not ours\n");
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
         for decoy in decoys {
             assert!(
@@ -484,16 +467,20 @@ mod tests {
     fn numeric_pruning_deletes_above_keep() {
         let dir = tempfile::tempdir().expect("tempdir");
         for n in 1..=6 {
-            fs::write(
-                dir.path().join(format!("web-0-out.log.{n}")),
+            seed(
+                dir.path(),
+                format!("web-0-out.log.{n}"),
                 format!("gen{n}\n"),
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Numeric, 3, false), &BTreeSet::new()).expect("tidied");
+        tidy(
+            &base,
+            &config(Naming::Numeric, 3, false),
+            &FileSet::default(),
+        )
+        .expect("tidied");
 
         assert!(dir.path().join("web-0-out.log.3").exists());
         assert!(!dir.path().join("web-0-out.log.4").exists());
@@ -507,16 +494,11 @@ mod tests {
         // created is not this dog's call to make.
         let dir = tempfile::tempdir().expect("tempdir");
         for n in 1..=9 {
-            fs::write(
-                dir.path().join(format!("web-0-out.log.{n}")),
-                "old scheme\n",
-            )
-            .expect("seeded");
+            seed(dir.path(), format!("web-0-out.log.{n}"), "old scheme\n");
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
         for n in 1..=9 {
             assert!(
@@ -529,21 +511,16 @@ mod tests {
     #[test]
     fn an_already_compressed_generation_is_not_compressed_twice() {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-05.log.gz"),
+        seed(
+            dir.path(),
+            "web-0-out.2026-08-20T15-04-05.log.gz",
             "already\n",
-        )
-        .expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-06.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        );
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 0);
         assert!(
@@ -557,17 +534,16 @@ mod tests {
     fn compression_off_leaves_everything_plain() {
         let dir = tempfile::tempdir().expect("tempdir");
         for stamp in ["15-04-05", "15-04-06"] {
-            fs::write(
-                dir.path().join(format!("web-0-out.2026-08-20T{stamp}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T{stamp}.log"),
                 "body\n",
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, false), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, false), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 0);
         assert!(
@@ -591,12 +567,11 @@ mod tests {
         // and then deleted on this same pass.
         let dir = tempfile::tempdir().expect("tempdir");
         for n in 1..=5 {
-            fs::write(dir.path().join(format!("web.{n}")), format!("gen{n}\n")).expect("seeded");
+            seed(dir.path(), format!("web.{n}"), format!("gen{n}\n"));
         }
-        fs::write(dir.path().join("web"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web")).expect("splits");
+        let base = live_log(dir.path(), "web", "live\n");
         let live_elsewhere = dir.path().join("web.2");
-        let protected = BTreeSet::from([live_elsewhere.clone()]);
+        let protected = FileSet::from_paths([live_elsewhere.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Numeric, 1, true), &protected).expect("tidied");
 
@@ -625,17 +600,15 @@ mod tests {
         // path can be what spares the file.
         let dir = tempfile::tempdir().expect("tempdir");
         for second in 1..=4 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 format!("gen{second}\n"),
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let oldest = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        let protected = BTreeSet::from([oldest.clone()]);
+        let protected = FileSet::from_paths([oldest.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
 
@@ -651,21 +624,12 @@ mod tests {
         // same harm as deleting it, so it gets the same refusal and the
         // plain generation is simply left uncompressed.
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-01.log"),
-            "ours\n",
-        )
-        .expect("seeded");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "ours\n");
         let live_elsewhere = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
         fs::write(&live_elsewhere, "somebody is writing here\n").expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
-        let protected = BTreeSet::from([live_elsewhere.clone()]);
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+        let protected = FileSet::from_paths([live_elsewhere.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 5, true), &protected).expect("tidied");
 
@@ -699,17 +663,15 @@ mod tests {
         let link = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
         std::os::unix::fs::symlink(&elsewhere, &link).expect("linked");
         for second in 2..=4 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 "ours\n",
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
         assert!(
             fs::symlink_metadata(&link).is_ok(),
@@ -734,17 +696,15 @@ mod tests {
         fs::create_dir(&collision).expect("created");
         fs::write(collision.join("notes.txt"), "an operator's own\n").expect("seeded");
         for second in 2..=4 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 "ours\n",
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
 
         assert!(collision.is_dir(), "still a directory");
         assert_eq!(
@@ -767,15 +727,10 @@ mod tests {
         let private = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
         fs::write(&private, "a token, probably\n").expect("seeded");
         fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("chmod");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         let mode = fs::metadata(dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"))
             .expect("the compressed copy")
@@ -789,21 +744,122 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_that_will_not_compress_does_not_stop_the_prune() {
+        // The .gz target of the middle generation is a directory, so its
+        // compression fails. The older generation still compresses, and with
+        // keep = 1 both are still pruned: the fault is the one generation's
+        // and the pass is not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for second in 1..=3 {
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
+                format!("gen{second}\n"),
+            );
+        }
+        let blocker = dir.path().join("web-0-out.2026-08-20T15-04-02.log.gz");
+        fs::create_dir(&blocker).expect("blocker");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
+
+        assert_eq!(tidied.faults.len(), 1, "{:?}", tidied.faults);
+        assert!(
+            tidied.faults[0].contains("15-04-02.log.gz"),
+            "{:?}",
+            tidied.faults
+        );
+        assert_eq!(
+            tidied.compressed, 1,
+            "the generation past the fault still compressed"
+        );
+        assert_eq!(tidied.deleted, 2, "and keep = 1 still pruned both");
+        assert!(
+            dir.path()
+                .join("web-0-out.2026-08-20T15-04-03.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-02.log")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("web-0-out.2026-08-20T15-04-01.log.gz")
+                .exists()
+        );
+        assert!(blocker.is_dir(), "the blocker is not this dog's to remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_gz_target_is_refused_not_written_through() {
+        // Somebody planted a link where this generation's archive goes.
+        // Creating the archive through it would truncate and fill whatever
+        // it points at, anywhere on disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = seed(dir.path(), "elsewhere.txt", "somebody else's file\n");
+        let plain = seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "ours\n");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let link = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("linked");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
+
+        let tidied =
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
+
+        assert_eq!(tidied.compressed, 0);
+        assert_eq!(tidied.faults.len(), 1, "{:?}", tidied.faults);
+        assert!(tidied.faults[0].contains("symlink"), "{:?}", tidied.faults);
+        assert_eq!(
+            fs::read_to_string(&elsewhere).expect("untouched"),
+            "somebody else's file\n"
+        );
+        assert!(plain.exists(), "the generation is left plain");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "and the link is not this dog's to remove"
+        );
+    }
+
+    #[test]
+    fn debug_carries_the_fault_paths() {
+        // The derived shape is the documented decision: the path is what an
+        // operator is shown on the summary line, so Debug shows it too.
+        let tidied = Tidied {
+            faults: vec!["/var/log/web-0-out.2026-08-20T15-04-01.log.gz: is a symlink".into()],
+            ..Tidied::default()
+        };
+        let shown = format!("{tidied:?}");
+        assert!(
+            shown.contains("/var/log/web-0-out.2026-08-20T15-04-01.log.gz"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn keep_larger_than_the_generation_count_deletes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         for second in 1..=3 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 "ours\n",
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        let tidied =
-            tidy(&base, &config(Naming::Dated, 10, false), &BTreeSet::new()).expect("tidied");
+        let tidied = tidy(
+            &base,
+            &config(Naming::Dated, 10, false),
+            &FileSet::default(),
+        )
+        .expect("tidied");
 
         assert_eq!(tidied.deleted, 0);
         for second in 1..=3 {
@@ -818,11 +874,10 @@ mod tests {
     #[test]
     fn a_base_with_nothing_to_tidy_is_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied, Tidied::default());
         assert!(
@@ -836,7 +891,7 @@ mod tests {
         let base = LogPath::split(&never_started).expect("splits");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied, Tidied::default());
     }
@@ -849,25 +904,20 @@ mod tests {
         // finishes what the last one started.
         let dir = tempfile::tempdir().expect("tempdir");
         let body = "the log that nearly got away\n";
-        fs::write(dir.path().join("web-0-out.2026-08-20T15-04-01.log"), body).expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"),
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", body);
+        seed(
+            dir.path(),
+            "web-0-out.2026-08-20T15-04-01.log.gz",
             "half a gzip stream",
-        )
-        .expect("seeded");
+        );
         // A newer generation, so the interrupted pair cannot land on index 0
         // and be spared as "the newest stays plain" whichever order the
         // directory happens to list them in.
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 1, "the plain half, and only it");
         assert!(
@@ -894,22 +944,17 @@ mod tests {
         // crash, and the module documents recovering from it.
         let dir = tempfile::tempdir().expect("tempdir");
         let body = "the generation that keep = 2 promised to keep\n";
-        fs::write(dir.path().join("web-0-out.2026-08-20T15-04-01.log"), body).expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"),
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", body);
+        seed(
+            dir.path(),
+            "web-0-out.2026-08-20T15-04-01.log.gz",
             "half a gzip stream",
-        )
-        .expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        );
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 2, true), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 2, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 1, "one generation, one compression");
         assert_eq!(tidied.deleted, 0, "two generations, and keep = 2");
@@ -940,28 +985,23 @@ mod tests {
         // `NotFound` and aborts the pass. Every older generation then goes
         // unpruned, on this tick and on every tick after it.
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-01.log"),
-            "doomed\n",
-        )
-        .expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"),
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "doomed\n");
+        seed(
+            dir.path(),
+            "web-0-out.2026-08-20T15-04-01.log.gz",
             "half a gzip stream",
-        )
-        .expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        );
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        let tidied = tidy(&base, &config(Naming::Dated, 1, true), &BTreeSet::new())
+        let tidied = tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default())
             .expect("the pass must not abort");
 
         assert_eq!(tidied.deleted, 1, "one file left of one generation");
+        // A second removal of the same path would fail NotFound, and that
+        // failure is recorded rather than returned now, so the count alone
+        // no longer proves the twin was removed once.
+        assert!(tidied.faults.is_empty(), "{:?}", tidied.faults);
         assert!(
             dir.path()
                 .join("web-0-out.2026-08-20T15-04-02.log")
@@ -991,16 +1031,11 @@ mod tests {
         let gz = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
         fs::write(&plain, "doomed\n").expect("seeded");
         fs::write(&gz, "also doomed\n").expect("seeded");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
-            tidy(&base, &config(Naming::Dated, 1, false), &BTreeSet::new()).expect("tidied");
+            tidy(&base, &config(Naming::Dated, 1, false), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.deleted, 2, "two files, one generation");
         assert!(!plain.exists());
@@ -1021,21 +1056,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("sub")).expect("created");
         for second in 1..=4 {
-            fs::write(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                dir.path(),
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 format!("gen{second}\n"),
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let spelled_the_long_way = dir
             .path()
             .join("sub")
             .join("..")
             .join("web-0-out.2026-08-20T15-04-01.log");
-        let protected = BTreeSet::from([spelled_the_long_way]);
+        let protected = FileSet::from_paths([spelled_the_long_way.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
 
@@ -1060,15 +1093,15 @@ mod tests {
         let through = dir.path().join("through");
         std::os::unix::fs::symlink(&real, &through).expect("linked");
         for second in 1..=4 {
-            fs::write(
-                real.join(format!("web-0-out.2026-08-20T15-04-0{second}.log")),
+            seed(
+                &real,
+                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
                 format!("gen{second}\n"),
-            )
-            .expect("seeded");
+            );
         }
-        fs::write(real.join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&real.join("web-0-out.log")).expect("splits");
-        let protected = BTreeSet::from([through.join("web-0-out.2026-08-20T15-04-01.log")]);
+        let base = live_log(&real, "web-0-out.log", "live\n");
+        let protected =
+            FileSet::from_paths([through.join("web-0-out.2026-08-20T15-04-01.log").as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
 
@@ -1093,15 +1126,10 @@ mod tests {
         let stale = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
         fs::write(&stale, "half a gzip stream").expect("seeded");
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).expect("chmod");
-        fs::write(
-            dir.path().join("web-0-out.2026-08-20T15-04-02.log"),
-            "newest\n",
-        )
-        .expect("seeded");
-        fs::write(dir.path().join("web-0-out.log"), "live\n").expect("seeded");
-        let base = LogPath::split(&dir.path().join("web-0-out.log")).expect("splits");
+        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
-        tidy(&base, &config(Naming::Dated, 5, true), &BTreeSet::new()).expect("tidied");
+        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         let mode = fs::metadata(&stale)
             .expect("the compressed copy")

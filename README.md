@@ -69,7 +69,7 @@ uncomment something.
 ```toml
 [dog.log-rotate]
 max_size = "10M"    # rotate once a log reaches this size
-max_age  = "168h"   # optionally also rotate on age, whatever the size
+max_age  = "168h"   # optionally also rotate this long after the last rotation
 keep     = 5        # rotated generations to keep, at least 1
 naming   = "dated"  # "dated" or "numeric", see below
 compress = true     # gzip all but the newest generation
@@ -79,11 +79,11 @@ interval = "60s"    # how often to look
 | Option | Default | Notes |
 | --- | --- | --- |
 | `max_size` | `"10M"` | shep's size grammar: `K`, `M`, `G`, uppercase, binary. `10M` is 10 MiB. `10MB` is refused. |
-| `max_age` | unset | Age alone is enough to rotate a log that never reached `max_size`. Unset means size only. |
+| `max_age` | unset | Rotates a log this long after its last rotation, whatever its size. A log never rotated counts from when it appeared, or from its last write on a filesystem that keeps no birth time. Unset means size only. |
 | `keep` | `5` | Counts rotated generations, never the live file. `keep = 0` is refused, since it would delete each rotation as it was made. |
 | `naming` | `"dated"` | See below. |
 | `compress` | `true` | The newest generation is left plain so it still greps without a decompression step. |
-| `interval` | `"60s"` | How long between passes. |
+| `interval` | `"60s"` | How long between passes. `0` is refused. |
 
 `max_age` and `interval` use shep's duration grammar, which has hours,
 minutes and seconds in lowercase and no day unit at all. A week is `"168h"`,
@@ -229,10 +229,11 @@ one that does not is rendered `silent`, restarted once, then declared stale.
 Nothing below 0.1.23 has a public way to send that name.
 
 The floor and the lockfile answer different questions. `^0.1.23` is the oldest
-client this code compiles against. `Cargo.lock` holds 0.1.27, the newest
-published, and that is what a reproducible build of this crate ships: `cargo
-install` honours a packaged lockfile under `--locked`, so that file decides
-what an installer compiles rather than what merely could compile.
+client this code compiles against. `Cargo.lock` pins whichever release was
+newest when it was last refreshed, and that is what a reproducible build of
+this crate ships: `cargo install` honours a packaged lockfile under `--locked`,
+so that file decides what an installer compiles rather than what merely could
+compile.
 
 Depending on the published surface rather than on a path is the point, not an
 accident. This project exists partly to find out whether somebody outside

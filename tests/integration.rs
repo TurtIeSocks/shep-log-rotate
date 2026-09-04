@@ -471,6 +471,17 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     wait_until("the adopted dog to rotate something", || {
         generations_oldest_first(&shepherd.logs(), "counter-0-out", true).len() > 1
     });
+    // The dog is adopted, so it keeps ticking while this test reads. A
+    // numeric shift landing between the listing below and the read of it
+    // renames a listed file away, and the read fails NotFound: measured at
+    // one run in ten with the whole tier running at once. Stop the sheep so
+    // the log stops growing, then wait until the live file is under the
+    // section's 8K, after which no rotation can start.
+    shepherd.ok(&["stop", "counter", "--style", "bare"]);
+    let live = shepherd.logs().join("counter-0-out.log");
+    wait_until("the dog to finish its last rotation", || {
+        fs::metadata(&live).is_ok_and(|meta| meta.len() < 8 * 1024) || !live.exists()
+    });
 
     // The dog is in the flock under its adopted name, and identified itself.
     // Only shep can put `weathervane` in this dog's environment, so a silent
@@ -485,8 +496,14 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
          default section, discarding every setting in [dog.weathervane]: {complaint}"
     );
 
-    // And it rotated at 8K rather than at the 10M default.
-    let files = generations_oldest_first(&shepherd.logs(), "counter-0-out", true);
+    // And it rotated at 8K rather than at the 10M default. The listing ends
+    // with the live path, which a stopped sheep may no longer have: the
+    // dog's last rotation renamed it away and there was nobody to reopen
+    // it for. Every line is then in the generations, so read what exists.
+    let files: Vec<PathBuf> = generations_oldest_first(&shepherd.logs(), "counter-0-out", true)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
     assert!(
         files.len() > 1,
         "nothing rotated, so [dog.weathervane] was never read: {files:?}"
@@ -623,6 +640,18 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
         shepherd
             .dog_stdout()
             .contains("whose rotated name is a live log")
+    });
+    // Beta was started second and prints a line every 50 ms, so under the
+    // load of the whole tier running at once it can still be at its first
+    // line when alpha has finished and the collision is already reported.
+    // Stopping it then leaves an empty live log, which the assertion below
+    // reads as "renamed out from under it". Measured at one run in five.
+    wait_until("beta to write its first line", || {
+        fs::read_to_string(real.join("app.log.1")).is_ok_and(|text| {
+            text.lines()
+                .next()
+                .is_some_and(|line| shep_client::shep_core::logstamp::strip(line) == "B0")
+        })
     });
     dog.stop();
     shepherd.ok(&["stop", "alpha", "--style", "bare"]);

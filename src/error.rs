@@ -5,7 +5,10 @@
 //! the variant names do not already say.
 
 use core::fmt;
-use std::path::PathBuf;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use shep_client::{ConnectError, RequestError};
 
@@ -66,6 +69,21 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// The [`Error::Io`] a failed call on `path` maps to, shaped for `map_err`.
+    ///
+    /// One definition of "which path an I/O failure is reported against"
+    /// rather than a closure spelling it at every `fs` call. The path is
+    /// whichever one the caller is most likely to go looking for on disk,
+    /// and that choice is made at the call site by what is passed in here.
+    pub fn io_at(path: &Path) -> impl FnOnce(io::Error) -> Self {
+        move |source| Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -114,6 +132,8 @@ impl From<RequestError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
+    use std::path::Path;
 
     #[test]
     fn an_io_error_names_the_path_it_failed_on() {
@@ -124,6 +144,22 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("/var/log/web-0-out.log"), "{shown}");
         assert!(shown.contains("denied"), "{shown}");
+    }
+
+    #[test]
+    fn io_at_names_the_path_the_call_failed_on() {
+        let missing = Path::new("/nonexistent/web-0-out.log");
+        let err = std::fs::metadata(missing)
+            .map_err(Error::io_at(missing))
+            .expect_err("nothing is there");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if path == missing),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("/nonexistent/web-0-out.log"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -176,8 +212,6 @@ mod tests {
     #[test]
     fn every_variant_renders_without_an_em_dash() {
         let err = Error::Protocol("the shepherd answered Pong to a DogConfig".into());
-        let shown = err.to_string();
-        assert!(!shown.contains('\u{2014}'), "em dash in {shown}");
-        assert!(!shown.contains('\u{2013}'), "en dash in {shown}");
+        assert_no_dashes(&err.to_string());
     }
 }

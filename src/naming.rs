@@ -61,9 +61,11 @@ impl LogPath {
     /// second copy of this rule somewhere downstream is a copy that can be
     /// missing from a third place.
     ///
-    /// Returns `None` if `path` has no file name, or if the file name or its
-    /// directory is not valid UTF-8. A path this dog cannot spell is a path
-    /// it must not go on to rename or delete.
+    /// Returns `None` if `path` has no file name, or if the file name is not
+    /// valid UTF-8. A name this dog cannot spell is a name it must not go on
+    /// to build generations from, rename, or delete. The directory is kept
+    /// as it came, UTF-8 or not: it is only ever joined and compared, never
+    /// spelled into a name.
     pub fn split(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
         // `file_stem`/`extension` already implement "the final extension,
@@ -82,15 +84,21 @@ impl LogPath {
 
     /// Rebuild the live log path this was split from.
     pub fn live(&self) -> PathBuf {
-        self.dir.join(self.file_name(String::new()))
+        self.dir.join(self.live_name())
+    }
+
+    /// The live log's file name alone: `web-0-out.log` for
+    /// `/var/log/web-0-out.log`.
+    pub fn live_name(&self) -> String {
+        self.file_name("")
     }
 
     /// The file name for this base, with `infix` spliced in before the
     /// extension. An empty `infix` rebuilds the live name.
-    fn file_name(&self, infix: String) -> String {
+    fn file_name(&self, infix: &str) -> String {
         let mut name = String::with_capacity(self.stem.len() + infix.len() + 8);
         name.push_str(&self.stem);
-        name.push_str(&infix);
+        name.push_str(infix);
         if let Some(ext) = &self.ext {
             name.push('.');
             name.push_str(ext);
@@ -185,6 +193,21 @@ pub fn stamp_utc(at: SystemTime) -> String {
     timestamp.strftime(STAMP_FORMAT).to_string()
 }
 
+/// Read a stamp [`stamp_utc`] produced back into the instant it names.
+///
+/// `None` for anything that is not exactly that shape. The one caller
+/// hands it stamps [`match_generation`] already accepted, so `None` there
+/// is a bug rather than a case, and it is treated as "no rotation on
+/// record" rather than panicked on.
+pub fn unstamp_utc(stamp: &str) -> Option<SystemTime> {
+    if !is_stamp(stamp.as_bytes()) {
+        return None;
+    }
+    let civil = jiff::civil::DateTime::strptime(STAMP_FORMAT, stamp).ok()?;
+    let zoned = civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    Some(SystemTime::from(zoned.timestamp()))
+}
+
 /// Build the dated name for a generation: `{stem}.{stamp}.{ext}`, or
 /// `{stem}.{stamp}.{counter}.{ext}` when `counter` is 1 or more.
 ///
@@ -207,7 +230,7 @@ pub fn dated_name(base: &LogPath, stamp: &str, counter: u32) -> PathBuf {
     } else {
         format!(".{stamp}.{counter}")
     };
-    base.dir.join(base.file_name(infix))
+    base.dir.join(base.file_name(&infix))
 }
 
 /// Build the numeric name for a generation: `{stem}.{ext}.{n}`.
@@ -222,7 +245,7 @@ pub fn dated_name(base: &LogPath, stamp: &str, counter: u32) -> PathBuf {
 #[track_caller]
 pub fn numeric_name(base: &LogPath, n: u32) -> PathBuf {
     debug_assert!(n >= 1, "numeric generations start at 1, not {n}");
-    let mut name = base.file_name(String::new());
+    let mut name = base.live_name();
     name.push('.');
     name.push_str(&n.to_string());
     base.dir.join(name)
@@ -296,7 +319,7 @@ fn match_dated(base: &LogPath, rest: &str) -> Option<Order> {
 
 /// Match `rest` (already `.gz`-stripped) as `{stem}.{ext}.{n}`.
 fn match_numeric(base: &LogPath, rest: &str) -> Option<Order> {
-    let live = base.file_name(String::new());
+    let live = base.live_name();
     let digits = rest.strip_prefix(&live)?.strip_prefix('.')?;
     Some(Order::Numeric {
         n: parse_index(digits.as_bytes())?,
@@ -404,6 +427,7 @@ mod tests {
         assert_eq!(split.stem, "web-0-out");
         assert_eq!(split.ext.as_deref(), Some("log"));
         assert_eq!(split.live(), Path::new("/var/log/web-0-out.log"));
+        assert_eq!(split.live_name(), "web-0-out.log");
     }
 
     #[test]
@@ -1055,6 +1079,29 @@ mod tests {
                 Some((Order::Numeric { n }, false)),
                 "{name} did not match itself back"
             );
+        }
+    }
+
+    #[test]
+    fn every_stamp_reads_back_to_the_second_it_named() {
+        for secs in [0, 1, 951_782_400, 1_787_324_645, 4_102_444_800] {
+            let at = std::time::UNIX_EPOCH + core::time::Duration::from_secs(secs);
+            let stamp = stamp_utc(at);
+            assert_eq!(unstamp_utc(&stamp), Some(at), "{stamp}");
+        }
+        // Sub-second precision is not in the stamp, so it is not read back.
+        let uneven = std::time::UNIX_EPOCH + core::time::Duration::from_millis(1_787_324_645_750);
+        assert_eq!(
+            unstamp_utc(&stamp_utc(uneven)),
+            Some(std::time::UNIX_EPOCH + core::time::Duration::from_secs(1_787_324_645))
+        );
+        for junk in [
+            "",
+            "2026-08-21",
+            "2026-08-21T15:04:05",
+            "2026-02-30T00-00-00",
+        ] {
+            assert_eq!(unstamp_utc(junk), None, "{junk:?}");
         }
     }
 

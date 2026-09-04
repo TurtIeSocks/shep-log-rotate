@@ -37,9 +37,13 @@
 
 mod config;
 mod error;
+mod file_set;
 mod naming;
 mod prune;
 mod rotate;
+mod stop;
+#[cfg(test)]
+mod test_support;
 mod tick;
 
 use core::fmt;
@@ -53,6 +57,7 @@ use shep_client::{
 use crate::{
     config::{Config, PRINT_CONFIG},
     error::Error,
+    stop::Stop,
     tick::{Live, tick},
 };
 
@@ -249,11 +254,15 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
 /// fails whenever this dog is started before the socket exists.
 ///
 /// There is no signal handling beyond `ctrl_c`, which is the clean-exit path
-/// for an operator running this in a terminal. The shepherd owns this
-/// process's signals and its kill ladder. Rotation on `SIGHUP` is a shape
-/// people expect from `logrotate`, and adding it here would be arguing with
-/// the supervisor about who decides when this process does work.
+/// for an operator running this in a terminal. It is honoured between
+/// ticks, and during a tick only while a generation is being gzipped: see
+/// [`tick()`] for why the rest of a tick runs to completion. The shepherd
+/// owns this process's signals and its kill ladder. Rotation on `SIGHUP` is
+/// a shape people expect from `logrotate`, and adding it here would be
+/// arguing with the supervisor about who decides when this process does
+/// work.
 async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
+    let mut stop = Stop::on_ctrl_c();
     // The interval to wait when there is no session to read one from. A
     // disconnected dog has no configuration either, so the default is the
     // only honest answer, and it is also the retry delay.
@@ -302,7 +311,7 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
             {
                 return refused(daemon_version.as_deref(), &message);
             }
-            match tick(live, &identity.section, SystemTime::now()).await {
+            match tick(live, &identity.section, SystemTime::now(), &mut stop).await {
                 Ok((config, report)) => {
                     interval = config.interval;
                     // Silence on a quiet tick is the point, not tidiness:
@@ -317,31 +326,34 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
             }
         }
 
-        if wait(interval).await == Interrupted::Yes {
+        if wait(interval, &mut stop).await == Interrupted::Yes {
             return ExitCode::SUCCESS;
         }
     }
 }
 
-/// Whether a wait ended in a signal rather than in the clock.
+/// Whether a wait ended in a stop request rather than in the clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interrupted {
     /// The interval elapsed.
     No,
-    /// `ctrl_c` arrived first.
+    /// A stop was requested first, or had been already.
     Yes,
 }
 
-/// Sleep for `interval`, or until `ctrl_c`.
-async fn wait(interval: UpDuration) -> Interrupted {
+/// Sleep for `interval`, or until a stop is requested.
+async fn wait(interval: UpDuration, stop: &mut Stop) -> Interrupted {
     tokio::select! {
+        // Biased, stop first: a stop already requested wins over a sleep
+        // that is also ready, rather than the coin toss an unbiased select
+        // would make of it.
+        biased;
+        () = stop.wait() => Interrupted::Yes,
         () = tokio::time::sleep(interval.as_duration()) => Interrupted::No,
-        _ = tokio::signal::ctrl_c() => Interrupted::Yes,
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = match Action::parse(args.iter().map(String::as_str)) {
         Ok(action) => action,
@@ -373,7 +385,26 @@ async fn main() -> ExitCode {
     };
     let paths = ShepPaths::resolve(&env, &home_dir);
     let identity = Identity::from_env(env);
-    poll(&paths.socket, &identity).await
+
+    // Built by hand rather than through `#[tokio::main]` for the line after
+    // the poll. Dropping a runtime waits for every blocking task it started,
+    // and a gzip abandoned on ctrl-c is one of those, so the exit would wait
+    // out the compression the operator just asked it not to. Shutting down
+    // in the background leaves that thread to die with the process; the
+    // half-written `.gz` it leaves is what the next pass overwrites.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("shep-log-rotate: cannot start a runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(poll(&paths.socket, &identity));
+    runtime.shutdown_background();
+    code
 }
 
 /// Compiles only when the `integration` feature is OFF, so a plain
@@ -392,6 +423,7 @@ fn heads_up_the_real_shepherd_tier_is_not_running() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
 
     /// An environment holding exactly one variable, which is the only one
     /// [`Identity::from_env`] reads.
@@ -423,8 +455,7 @@ mod tests {
         let usage = Action::parse(["--nonsense"])
             .expect_err("refused")
             .to_string();
-        assert!(!usage.contains('\u{2014}'));
-        assert!(!usage.contains('\u{2013}'));
+        assert_no_dashes(&usage);
     }
 
     #[test]

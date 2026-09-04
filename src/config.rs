@@ -25,7 +25,9 @@ pub enum Naming {
 pub struct Config {
     /// Rotate a log once it reaches this size.
     pub max_size: MemSize,
-    /// Optionally also rotate on age, whatever the size.
+    /// Optionally also rotate this long after the last rotation, whatever
+    /// the size. A log never rotated counts from when it appeared, or from
+    /// its last write where the filesystem keeps no birth time.
     pub max_age: Option<UpDuration>,
     /// Generations to keep. Older ones are deleted.
     pub keep: usize,
@@ -87,6 +89,9 @@ pub enum ConfigError {
     Naming(String),
     /// `keep = 0`, which would delete every rotation the moment it was made.
     Keep,
+    /// `interval = 0`, which would ask the shepherd again the moment an
+    /// answer came back.
+    Interval,
 }
 
 impl fmt::Display for ConfigError {
@@ -117,6 +122,10 @@ impl fmt::Display for ConfigError {
                 f,
                 "keep = 0 would delete every rotation the moment it was made; keep must be at least 1"
             ),
+            Self::Interval => write!(
+                f,
+                "interval = 0 would ask the shepherd without pause; interval must be above 0"
+            ),
         }
     }
 }
@@ -126,7 +135,7 @@ impl core::error::Error for ConfigError {
         match self {
             Self::Size { source, .. } => Some(source),
             Self::Duration { source, .. } => Some(source),
-            Self::Toml(_) | Self::Naming(_) | Self::Keep => None,
+            Self::Toml(_) | Self::Naming(_) | Self::Keep | Self::Interval => None,
         }
     }
 }
@@ -182,9 +191,19 @@ impl Config {
     /// - [`ConfigError::Naming`] - `naming` is neither `dated` nor `numeric`.
     /// - [`ConfigError::Keep`] - `keep = 0`, which would delete every
     ///   rotation the moment it was made.
+    /// - [`ConfigError::Interval`] - `interval = 0`, which would poll
+    ///   without pause.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let raw: Raw = toml::from_str(text).map_err(|err| ConfigError::Toml(err.to_string()))?;
         let defaults = Self::default();
+        let interval = raw
+            .interval
+            .map(|value| parse_duration(value, "interval"))
+            .transpose()?
+            .unwrap_or(defaults.interval);
+        if interval.as_duration().is_zero() {
+            return Err(ConfigError::Interval);
+        }
         Ok(Self {
             max_size: raw
                 .max_size
@@ -207,11 +226,7 @@ impl Config {
                 Some(other) => return Err(ConfigError::Naming(other.to_owned())),
             },
             compress: raw.compress.unwrap_or(defaults.compress),
-            interval: raw
-                .interval
-                .map(|value| parse_duration(value, "interval"))
-                .transpose()?
-                .unwrap_or(defaults.interval),
+            interval,
         })
     }
 }
@@ -226,7 +241,9 @@ impl Config {
 pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
 # Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
 #max_size = "10M"
-# Optionally also rotate on age, whatever the size. Unset means size only.
+# Optionally also rotate this long after the last rotation, whatever the
+# size. A log never rotated counts from when it appeared, or from its last
+# write where the filesystem keeps no birth time. Unset means size only.
 # shep's UpDuration has no day unit: spell a week as hours, not "7d".
 #max_age = "168h"
 # Generations to keep. Older ones are deleted. Must be at least 1.
@@ -238,13 +255,14 @@ pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
 #naming = "dated"
 # gzip rotated generations. The newest is left plain so it stays greppable.
 #compress = true
-# How often to look.
+# How often to look. Must be above 0.
 #interval = "60s"
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
 
     #[test]
     fn an_absent_section_is_a_working_configuration() {
@@ -317,6 +335,15 @@ interval = "5s"
     }
 
     #[test]
+    fn interval_zero_is_refused_because_it_would_poll_without_pause() {
+        for spelling in ["0", "0s", "0m"] {
+            let err =
+                Config::from_toml(&format!("interval = \"{spelling}\"")).expect_err("refused");
+            assert!(err.to_string().contains("interval"), "{err}");
+        }
+    }
+
+    #[test]
     fn every_value_the_printed_block_documents_is_the_value_the_code_uses() {
         // PRINT_CONFIG has three kinds of line: the `[dog.log-rotate]` header,
         // prose comments (`# ` with a space), and commented settings
@@ -356,7 +383,6 @@ interval = "5s"
 
     #[test]
     fn the_printed_block_carries_no_em_dash() {
-        assert!(!PRINT_CONFIG.contains('\u{2014}'));
-        assert!(!PRINT_CONFIG.contains('\u{2013}'));
+        assert_no_dashes(PRINT_CONFIG);
     }
 }
