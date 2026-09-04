@@ -132,6 +132,7 @@ impl From<RequestError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
     use std::path::Path;
 
     #[test]
@@ -211,8 +212,6 @@ mod tests {
     #[test]
     fn every_variant_renders_without_an_em_dash() {
         let err = Error::Protocol("the shepherd answered Pong to a DogConfig".into());
-        let shown = err.to_string();
-        assert!(!shown.contains('\u{2014}'), "em dash in {shown}");
-        assert!(!shown.contains('\u{2013}'), "en dash in {shown}");
+        assert_no_dashes(&err.to_string());
     }
 }

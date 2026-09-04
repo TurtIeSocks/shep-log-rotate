@@ -515,6 +515,7 @@ fn named(response: &Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
 
@@ -930,8 +931,7 @@ mod tests {
         };
         let line = busy.summary().expect("a tick that rotated says so");
         assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(!line.contains('\u{2014}'), "{line}");
-        assert!(!line.contains('\u{2013}'), "{line}");
+        assert_no_dashes(&line);
     }
 
     #[cfg(unix)]

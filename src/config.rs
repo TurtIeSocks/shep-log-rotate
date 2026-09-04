@@ -245,6 +245,7 @@ pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
 
     #[test]
     fn an_absent_section_is_a_working_configuration() {
@@ -356,7 +357,6 @@ interval = "5s"
 
     #[test]
     fn the_printed_block_carries_no_em_dash() {
-        assert!(!PRINT_CONFIG.contains('\u{2014}'));
-        assert!(!PRINT_CONFIG.contains('\u{2013}'));
+        assert_no_dashes(PRINT_CONFIG);
     }
 }

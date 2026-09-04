@@ -186,14 +186,8 @@ fn rename(from: &Path, to: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Naming;
+    use crate::{config::Naming, test_support::seed};
     use std::fs;
-
-    fn seed(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        fs::write(&path, body).expect("seeded");
-        path
-    }
 
     /// Serialises the two tests that have to run from inside a temporary
     /// directory. The working directory belongs to the process, not to a
@@ -502,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         seed(
             dir.path(),
-            &format!("web-0-out.log.{}", u32::MAX),
+            format!("web-0-out.log.{}", u32::MAX),
             "oldest\n",
         );
         let live = seed(dir.path(), "web-0-out.log", "live\n");

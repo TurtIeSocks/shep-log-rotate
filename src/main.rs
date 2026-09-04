@@ -41,6 +41,8 @@ mod file_set;
 mod naming;
 mod prune;
 mod rotate;
+#[cfg(test)]
+mod test_support;
 mod tick;
 
 use core::fmt;
@@ -393,6 +395,7 @@ fn heads_up_the_real_shepherd_tier_is_not_running() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_no_dashes;
 
     /// An environment holding exactly one variable, which is the only one
     /// [`Identity::from_env`] reads.
@@ -424,8 +427,7 @@ mod tests {
         let usage = Action::parse(["--nonsense"])
             .expect_err("refused")
             .to_string();
-        assert!(!usage.contains('\u{2014}'));
-        assert!(!usage.contains('\u{2013}'));
+        assert_no_dashes(&usage);
     }
 
     #[test]
