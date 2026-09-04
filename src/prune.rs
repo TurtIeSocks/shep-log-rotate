@@ -178,7 +178,7 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
                 continue;
             }
             // A `.gz` already sitting there is the half-written leftover of
-            // the crash that made this generation a twin. Overwriting it is
+            // the crash that made this generation a twin. Replacing it is
             // how the interrupted compression finishes.
             if let Err(err) = compress(&plain, &target) {
                 tidied.faults.push(err.to_string());
@@ -227,33 +227,54 @@ fn is_protected(names: &BTreeSet<String>, path: &Path) -> bool {
         .is_some_and(|name| names.contains(name))
 }
 
-/// Create `target` truncated and already at `permissions`, and hand back the
+/// Create `target`, empty and already at `permissions`, and hand back the
 /// open handle.
 ///
-/// The two steps live in one function because they have to stay adjacent.
-/// `File::create` opens at `0o666 & !umask`, so a chmod that drifts away
-/// from it, down to the end of a longer function say, leaves a log that is
-/// private for a reason readable by anyone for the entire length of the
-/// gzip. On a large log that is not a short window, and no test can see it:
-/// what a test can check is that the mode is right at the end, which is true
-/// either way. Keeping the pair together is the guard.
+/// The create is exclusive: `O_EXCL` never follows a symlink, so this is
+/// the one create that cannot be pointed somewhere else by a link planted
+/// at the target's name. Nothing this dog writes is a symlink, so one found
+/// there is somebody else's and is refused. A regular file found there is
+/// the half-written leftover of the crash that made this generation a
+/// twin, and finishing the compression means replacing it: it is removed
+/// and the create runs again, as exclusive as the first, so a link planted
+/// in between is refused too. A check before an ordinary create would
+/// leave that window open.
 ///
+/// The permissions go on the handle rather than the path, and in the same
+/// function as the create, because the two have to stay adjacent. A create
+/// opens at `0o666 & !umask`, so a chmod that drifts away from it, down to
+/// the end of a longer function say, leaves a log that is private for a
+/// reason readable by anyone for the entire length of the gzip. On a large
+/// log that is not a short window, and no test can see it: what a test can
+/// check is that the mode is right at the end, which is true either way.
 /// Only the empty file is ever at the creation mode, and the handle keeps
-/// its write access across the change, so a read-only mode still works here.
+/// its write access across the change, so a read-only mode still works.
 fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
-    // `File::create` follows a symlink, and would truncate and fill whatever
-    // one planted at the target's name points at, anywhere on disk. Nothing
-    // this dog writes is a symlink, so one sitting here is somebody else's
-    // and is refused rather than written through. A check before the create
-    // rather than `O_NOFOLLOW`, which std does not spell portably.
-    if fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Err(Error::io_at(target)(io::Error::other(
-            "is a symlink, and this dog does not write through one",
-        )));
-    }
-    let file = fs::File::create(target).map_err(Error::io_at(target))?;
-    fs::set_permissions(target, permissions).map_err(Error::io_at(target))?;
+    let file = match create_new(target) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let found = fs::symlink_metadata(target).map_err(Error::io_at(target))?;
+            if found.file_type().is_symlink() {
+                return Err(Error::io_at(target)(io::Error::other(
+                    "is a symlink, and this dog does not write through one",
+                )));
+            }
+            remove(target)?;
+            create_new(target).map_err(Error::io_at(target))?
+        }
+        Err(err) => return Err(Error::io_at(target)(err)),
+    };
+    file.set_permissions(permissions)
+        .map_err(Error::io_at(target))?;
     Ok(file)
+}
+
+/// Create `target` for writing, failing if anything is at that name.
+fn create_new(target: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
 }
 
 /// gzip `path` into `target`, then remove `path`.
